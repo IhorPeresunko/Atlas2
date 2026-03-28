@@ -1,0 +1,10 @@
+/target
+/data
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+.env
+.DS_Store
+.idea/
+.vscode/

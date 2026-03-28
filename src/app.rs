@@ -1,11 +1,12 @@
 use crate::{
     codex::CodexClient,
-    config::Config,
+    config::{CliArgs, Config},
     domain::{ApprovalId, TelegramChatId, TelegramUserId},
     error::{AppError, AppResult},
     filesystem::FilesystemService,
     services::{AppServices, FolderCallbackResult},
     storage::Storage,
+    stt::SttClient,
     telegram::TelegramClient,
 };
 
@@ -15,8 +16,8 @@ pub struct App {
 }
 
 impl App {
-    pub async fn bootstrap() -> AppResult<Self> {
-        let config = Config::load()?;
+    pub async fn bootstrap(cli: CliArgs) -> AppResult<Self> {
+        let config = Config::load(cli)?;
         ensure_database_parent_dir(&config.database_url)?;
         let storage = Storage::connect(&config.database_url).await?;
         let telegram = TelegramClient::new(&config.telegram_api_base, &config.telegram_bot_token);
@@ -25,9 +26,10 @@ impl App {
             config.codex_bin.clone(),
             config.workspace_additional_writable_dirs.clone(),
         );
+        let stt = SttClient::from_config(&config)?;
 
         Ok(Self {
-            services: AppServices::new(config, storage, telegram, filesystem, codex),
+            services: AppServices::new(config, storage, telegram, filesystem, codex, stt),
         })
     }
 
@@ -58,90 +60,111 @@ impl App {
                 .register_chat(chat_id, &message.chat.kind, message.chat.title.as_deref())
                 .await?;
 
-            let Some(text) = message.text.clone() else {
-                return Ok(());
-            };
             let user_id = message
                 .from
                 .as_ref()
                 .map(|user| TelegramUserId(user.id))
                 .ok_or_else(|| AppError::Validation("message missing sender".into()))?;
 
-            match parse_message_text(&text) {
-                IncomingMessage::Help => {
-                    self.services
-                        .telegram
-                        .send_message(
-                            chat_id,
-                            "Atlas2 commands:\n/new - select a folder and create a new session\n/sessions - list known sessions\n/plan <prompt> - run a read-only planning turn\nAny other text - send a prompt to the active Codex session",
-                            None,
-                            None,
-                        )
-                        .await?;
+            if let Some(text) = message.text.clone() {
+                match parse_message_text(&text) {
+                    IncomingMessage::Help => {
+                        self.services
+                            .telegram
+                            .send_message(
+                                chat_id,
+                                "Atlas2 commands:\n/new - select a folder and create a new session\n/sessions - list known sessions\n/plan <prompt> - run a read-only planning turn\nAny other text - send a prompt to the active Codex session",
+                                None,
+                                None,
+                            )
+                            .await?;
+                    }
+                    IncomingMessage::NewSession => {
+                        self.services.require_group_admin(chat_id, user_id).await?;
+                        let text = self.services.begin_folder_selection(chat_id).await?;
+                        let markup = self.services.folder_markup("/").await?;
+                        self.services
+                            .telegram
+                            .send_message(chat_id, &text, None, Some(markup))
+                            .await?;
+                    }
+                    IncomingMessage::Sessions => {
+                        let summary = self.services.render_sessions().await?;
+                        self.services
+                            .telegram
+                            .send_message(chat_id, &summary, None, None)
+                            .await?;
+                    }
+                    IncomingMessage::Plan(prompt) => {
+                        let prompt = prompt.to_string();
+                        let services = self.services.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = services.run_plan_prompt(chat_id, &prompt).await {
+                                let _ = services
+                                    .telegram
+                                    .send_message(
+                                        chat_id,
+                                        &format!("Prompt failed: {error}"),
+                                        None,
+                                        None,
+                                    )
+                                    .await;
+                            }
+                        });
+                    }
+                    IncomingMessage::PlanUsage => {
+                        self.services
+                            .telegram
+                            .send_message(chat_id, "Usage: /plan <prompt>", None, None)
+                            .await?;
+                    }
+                    IncomingMessage::UnknownCommand => {
+                        self.services
+                            .telegram
+                            .send_message(chat_id, "Unknown command.", None, None)
+                            .await?;
+                    }
+                    IncomingMessage::Prompt(prompt) => {
+                        let prompt = prompt.to_string();
+                        let services = self.services.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = services.run_prompt(chat_id, &prompt).await {
+                                let _ = services
+                                    .telegram
+                                    .send_message(
+                                        chat_id,
+                                        &format!("Prompt failed: {error}"),
+                                        None,
+                                        None,
+                                    )
+                                    .await;
+                            }
+                        });
+                    }
                 }
-                IncomingMessage::NewSession => {
-                    self.services.require_group_admin(chat_id, user_id).await?;
-                    let text = self.services.begin_folder_selection(chat_id).await?;
-                    let markup = self.services.folder_markup("/").await?;
-                    self.services
-                        .telegram
-                        .send_message(chat_id, &text, None, Some(markup))
-                        .await?;
-                }
-                IncomingMessage::Sessions => {
-                    let summary = self.services.render_sessions().await?;
-                    self.services
-                        .telegram
-                        .send_message(chat_id, &summary, None, None)
-                        .await?;
-                }
-                IncomingMessage::Plan(prompt) => {
-                    let prompt = prompt.to_string();
-                    let services = self.services.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = services.run_plan_prompt(chat_id, &prompt).await {
-                            let _ = services
-                                .telegram
-                                .send_message(
-                                    chat_id,
-                                    &format!("Prompt failed: {error}"),
-                                    None,
-                                    None,
-                                )
-                                .await;
-                        }
-                    });
-                }
-                IncomingMessage::PlanUsage => {
-                    self.services
-                        .telegram
-                        .send_message(chat_id, "Usage: /plan <prompt>", None, None)
-                        .await?;
-                }
-                IncomingMessage::UnknownCommand => {
-                    self.services
-                        .telegram
-                        .send_message(chat_id, "Unknown command.", None, None)
-                        .await?;
-                }
-                IncomingMessage::Prompt(prompt) => {
-                    let prompt = prompt.to_string();
-                    let services = self.services.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = services.run_prompt(chat_id, &prompt).await {
-                            let _ = services
-                                .telegram
-                                .send_message(
-                                    chat_id,
-                                    &format!("Prompt failed: {error}"),
-                                    None,
-                                    None,
-                                )
-                                .await;
-                        }
-                    });
-                }
+                return Ok(());
             }
+
+            if let Some(voice) = message.voice {
+                let services = self.services.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = services
+                        .run_voice_prompt(
+                            chat_id,
+                            &voice.file_id,
+                            &voice.file_unique_id,
+                            voice.mime_type.as_deref(),
+                        )
+                        .await
+                    {
+                        let _ = services
+                            .telegram
+                            .send_message(chat_id, &format!("Prompt failed: {error}"), None, None)
+                            .await;
+                    }
+                });
+            }
+
             return Ok(());
         }
 
@@ -178,7 +201,13 @@ impl App {
                     FolderCallbackResult::Render(text, markup) => {
                         self.services
                             .telegram
-                            .edit_message_text(chat_id, message.message_id, &text, None, Some(markup))
+                            .edit_message_text(
+                                chat_id,
+                                message.message_id,
+                                &text,
+                                None,
+                                Some(markup),
+                            )
                             .await?;
                         Ok("Updated folder browser.".into())
                     }

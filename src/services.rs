@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use chrono::Utc;
+use regex::Regex;
 use tokio::sync::{
     Mutex, OwnedMutexGuard,
     mpsc::{UnboundedSender, unbounded_channel},
@@ -16,6 +17,7 @@ use crate::{
     error::{AppError, AppResult},
     filesystem::FilesystemService,
     storage::Storage,
+    stt::SttClient,
     telegram::{InlineKeyboardMarkup, ParseMode, TelegramClient, button},
 };
 
@@ -28,6 +30,7 @@ pub struct AppServices {
     pub telegram: TelegramClient,
     pub filesystem: FilesystemService,
     pub codex: CodexClient,
+    pub stt: SttClient,
     session_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
 }
 
@@ -38,6 +41,7 @@ impl AppServices {
         telegram: TelegramClient,
         filesystem: FilesystemService,
         codex: CodexClient,
+        stt: SttClient,
     ) -> Self {
         Self {
             config,
@@ -45,6 +49,7 @@ impl AppServices {
             telegram,
             filesystem,
             codex,
+            stt,
             session_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -315,6 +320,40 @@ impl AppServices {
             .await
     }
 
+    pub async fn run_voice_prompt(
+        &self,
+        chat_id: TelegramChatId,
+        file_id: &str,
+        file_unique_id: &str,
+        mime_type: Option<&str>,
+    ) -> AppResult<()> {
+        let _guard = self.acquire_session_lock(chat_id).await;
+        self.require_active_session(chat_id).await?;
+
+        let file = self.telegram.get_file(file_id).await?;
+        let file_path = file.file_path.ok_or_else(|| {
+            AppError::Telegram("telegram getFile returned no file_path for voice message".into())
+        })?;
+        let audio_bytes = self.telegram.download_file_bytes(&file_path).await?;
+        let mime_type = mime_type.unwrap_or("audio/ogg");
+        let transcript = self
+            .stt
+            .transcribe_voice(&format!("{file_unique_id}.oga"), mime_type, audio_bytes)
+            .await?;
+
+        self.telegram
+            .send_message(
+                chat_id,
+                &render_voice_transcript_message(&transcript),
+                None,
+                None,
+            )
+            .await?;
+
+        self.run_prompt_with_mode_locked(chat_id, &transcript, PromptMode::Normal)
+            .await
+    }
+
     async fn run_prompt_with_mode(
         &self,
         chat_id: TelegramChatId,
@@ -322,16 +361,18 @@ impl AppServices {
         mode: PromptMode,
     ) -> AppResult<()> {
         let _guard = self.acquire_session_lock(chat_id).await;
+        self.run_prompt_with_mode_locked(chat_id, prompt, mode)
+            .await
+    }
+
+    async fn run_prompt_with_mode_locked(
+        &self,
+        chat_id: TelegramChatId,
+        prompt: &str,
+        mode: PromptMode,
+    ) -> AppResult<()> {
         let _chat_binding = self.storage.get_chat(chat_id).await?;
-        let session = self
-            .storage
-            .get_active_session_for_chat(chat_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::Validation(
-                    "this group does not have an active session; run /new first".into(),
-                )
-            })?;
+        let session = self.require_active_session(chat_id).await?;
 
         self.storage
             .update_session_runtime(&session.session_id, SessionStatus::Running, None)
@@ -484,6 +525,17 @@ impl AppServices {
         };
         arc.lock_owned().await
     }
+
+    async fn require_active_session(&self, chat_id: TelegramChatId) -> AppResult<SessionRecord> {
+        self.storage
+            .get_active_session_for_chat(chat_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Validation(
+                    "this group does not have an active session; run /new first".into(),
+                )
+            })
+    }
 }
 
 pub enum FolderCallbackResult {
@@ -531,12 +583,20 @@ fn build_codex_prompt(prompt: &str, mode: PromptMode) -> String {
     }
 }
 
+fn render_voice_transcript_message(transcript: &str) -> String {
+    trim_for_telegram(&format!(
+        "Transcribed voice message:\n{}",
+        compact_text_for_telegram(transcript)
+    ))
+}
+
 fn send_text_update(
     telegram_updates_tx: &UnboundedSender<TelegramTurnUpdate>,
     text: impl Into<String>,
 ) {
+    let compact = compact_text_for_telegram(&text.into());
     let _ = telegram_updates_tx.send(TelegramTurnUpdate::Message(TelegramMessage {
-        text: trim_for_telegram(&text.into()),
+        text: trim_for_telegram(&compact),
         parse_mode: None,
     }));
 }
@@ -633,13 +693,89 @@ fn escape_html(text: &str) -> String {
     escaped
 }
 
+fn compact_text_for_telegram(text: &str) -> String {
+    let mut compacted = replace_markdown_file_links(text);
+    compacted = shorten_bare_absolute_paths(&compacted);
+    compacted
+}
+
+fn replace_markdown_file_links(text: &str) -> String {
+    let re = Regex::new(r"\[([^\]]+)\]\((/[^)\s]+)\)").expect("valid markdown file link regex");
+    re.replace_all(text, |captures: &regex::Captures<'_>| {
+        compact_path_label(&captures[1])
+    })
+    .into_owned()
+}
+
+fn shorten_bare_absolute_paths(text: &str) -> String {
+    let re = Regex::new(r"(/home/[^\s)\]]+)").expect("valid absolute path regex");
+    re.replace_all(text, |captures: &regex::Captures<'_>| {
+        compact_absolute_path(&captures[1])
+    })
+    .into_owned()
+}
+
+fn compact_path_label(label: &str) -> String {
+    if label.contains('/') {
+        compact_relative_path(label)
+    } else {
+        label.to_string()
+    }
+}
+
+fn compact_relative_path(label: &str) -> String {
+    let (path, suffix) = split_path_suffix(label);
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.len() <= 3 {
+        return label.to_string();
+    }
+
+    format!(
+        ".../{}/{}{}",
+        segments[segments.len() - 2],
+        segments[segments.len() - 1],
+        suffix
+    )
+}
+
+fn compact_absolute_path(path: &str) -> String {
+    let (path, suffix) = split_path_suffix(path);
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.len() <= 3 {
+        return format!("{path}{suffix}");
+    }
+
+    format!(
+        ".../{}/{}{}",
+        segments[segments.len() - 2],
+        segments[segments.len() - 1],
+        suffix
+    )
+}
+
+fn split_path_suffix(path: &str) -> (&str, &str) {
+    for marker in ["#L", ":", "?"] {
+        if let Some(index) = path.find(marker) {
+            return (&path[..index], &path[index..]);
+        }
+    }
+    (path, "")
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{
         domain::PromptMode,
         services::{
-            TELEGRAM_TEXT_LIMIT, TelegramTurnUpdate, build_codex_prompt,
-            render_command_finished_message, send_text_update, trim_for_telegram,
+            TELEGRAM_TEXT_LIMIT, TelegramTurnUpdate, build_codex_prompt, compact_text_for_telegram,
+            render_command_finished_message, render_voice_transcript_message, send_text_update,
+            trim_for_telegram,
         },
         telegram::ParseMode,
     };
@@ -664,6 +800,21 @@ mod tests {
         };
         assert_eq!(message.text.len(), TELEGRAM_TEXT_LIMIT);
         assert_eq!(message.parse_mode, None);
+    }
+
+    #[test]
+    fn queued_text_updates_compact_markdown_file_links() {
+        let (tx, mut rx) = unbounded_channel();
+        send_text_update(
+            &tx,
+            "- See [api/app/modules/telephony/routes.py](/home/ihor/code/clients/aicalls/api/app/modules/telephony/routes.py#L1039)",
+        );
+
+        let update = rx.try_recv().expect("queued update");
+        let TelegramTurnUpdate::Message(message) = update else {
+            panic!("expected message update");
+        };
+        assert_eq!(message.text, "- See .../telephony/routes.py");
     }
 
     #[test]
@@ -709,11 +860,8 @@ mod tests {
 
     #[test]
     fn command_finished_messages_escape_html_sensitive_text() {
-        let message = render_command_finished_message(
-            "echo \"<tag>\" && true",
-            1,
-            "<ok> & \"quoted\"",
-        );
+        let message =
+            render_command_finished_message("echo \"<tag>\" && true", 1, "<ok> & \"quoted\"");
 
         assert!(message.text.contains("&lt;tag&gt;"));
         assert!(message.text.contains("&amp;"));
@@ -733,5 +881,32 @@ mod tests {
         let message = render_command_finished_message("cmd", 0, "");
 
         assert!(message.text.contains("(no output)"));
+    }
+
+    #[test]
+    fn compacts_bare_absolute_paths() {
+        let compacted = compact_text_for_telegram(
+            "Check /home/ihor/code/clients/aicalls/web/src/routes/_authenticated/call-agents.tsx#L1 for details.",
+        );
+
+        assert_eq!(
+            compacted,
+            "Check .../_authenticated/call-agents.tsx#L1 for details."
+        );
+    }
+
+    #[test]
+    fn leaves_short_non_path_text_unchanged() {
+        let compacted = compact_text_for_telegram("Status: turn started");
+
+        assert_eq!(compacted, "Status: turn started");
+    }
+
+    #[test]
+    fn renders_voice_transcript_message() {
+        let message = render_voice_transcript_message("inspect /home/ihor/code/atlas2/src/app.rs");
+
+        assert!(message.starts_with("Transcribed voice message:\n"));
+        assert!(message.contains(".../src/app.rs"));
     }
 }

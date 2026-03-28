@@ -16,6 +16,7 @@
 - `/sessions` lists all known sessions globally, including the group and workspace bound to each.
 - `/plan <prompt>` runs a plan-only Codex turn for the current session.
 - Any non-command text in a group with an active session is treated as a prompt for Codex.
+- Telegram `voice` messages in a group with an active session should be transcribed and treated as prompts for Codex when STT is enabled.
 
 ## Folder Selection
 
@@ -60,6 +61,7 @@
 - On startup, Atlas2 should load the Telegram bot token from the process environment when available.
 - If the token is not already present in the process environment, Atlas2 should load it from a local persisted token file when available.
 - If no token is available from either source, Atlas2 should prompt once, keep the token in memory for the running process, and persist it to a local token file for later restarts.
+- When started with `--stt-provider 11labs`, Atlas2 should load the ElevenLabs API key from `--stt-api-key` when provided, otherwise from a local persisted key file, otherwise by prompting once and persisting it for later restarts.
 - Atlas2 should not depend on Docker or Docker Compose for normal use.
 - SQLite is the default persistence backend for a shareable single-instance build.
 - The local machine must already have `codex` installed and authenticated.

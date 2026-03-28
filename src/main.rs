@@ -6,9 +6,12 @@ mod error;
 mod filesystem;
 mod services;
 mod storage;
+mod stt;
 mod telegram;
 
 use app::App;
+use clap::Parser;
+use config::CliArgs;
 use error::AppResult;
 
 #[tokio::main]
@@ -20,6 +23,7 @@ async fn main() -> AppResult<()> {
         )
         .init();
 
-    let app = App::bootstrap().await?;
+    let cli = CliArgs::parse();
+    let app = App::bootstrap(cli).await?;
     app.run().await
 }

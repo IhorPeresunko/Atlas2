@@ -10,6 +10,7 @@ use crate::{
 pub struct TelegramClient {
     http: reqwest::Client,
     base_url: String,
+    file_base_url: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -20,10 +21,13 @@ pub enum ParseMode {
 
 impl TelegramClient {
     pub fn new(api_base: &str, bot_token: &str) -> Self {
-        let base_url = format!("{}/bot{}", api_base.trim_end_matches('/'), bot_token);
+        let api_base = api_base.trim_end_matches('/');
+        let base_url = format!("{api_base}/bot{bot_token}");
+        let file_base_url = format!("{api_base}/file/bot{bot_token}");
         Self {
             http: reqwest::Client::new(),
             base_url,
+            file_base_url,
         }
     }
 
@@ -117,6 +121,27 @@ impl TelegramClient {
         .await
     }
 
+    pub async fn get_file(&self, file_id: &str) -> AppResult<TelegramFile> {
+        self.call("getFile", &json!({ "file_id": file_id })).await
+    }
+
+    pub async fn download_file_bytes(&self, file_path: &str) -> AppResult<Vec<u8>> {
+        let response = self
+            .http
+            .get(format!("{}/{}", self.file_base_url, file_path))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(AppError::Telegram(format!(
+                "telegram file download failed with status {}",
+                response.status()
+            )));
+        }
+
+        Ok(response.bytes().await?.to_vec())
+    }
+
     async fn call<T: DeserializeOwned>(&self, method: &str, payload: &Value) -> AppResult<T> {
         let response = self
             .http
@@ -160,6 +185,7 @@ pub struct Message {
     pub chat: Chat,
     pub from: Option<User>,
     pub text: Option<String>,
+    pub voice: Option<Voice>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -185,6 +211,18 @@ pub struct CallbackQuery {
     pub from: User,
     pub message: Option<Message>,
     pub data: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Voice {
+    pub file_id: String,
+    pub file_unique_id: String,
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TelegramFile {
+    pub file_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -221,5 +259,47 @@ pub fn button(text: impl Into<String>, callback_data: impl Into<String>) -> Inli
     InlineKeyboardButton {
         text: text.into(),
         callback_data: callback_data.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TelegramFile, Update};
+
+    #[test]
+    fn deserializes_voice_message_update() {
+        let update: Update = serde_json::from_str(
+            r#"{
+                "update_id": 1,
+                "message": {
+                    "message_id": 10,
+                    "chat": {"id": -1001, "type": "supergroup", "title": "Atlas"},
+                    "from": {"id": 42, "username": "atlas", "first_name": "Atlas"},
+                    "voice": {
+                        "file_id": "voice-file",
+                        "file_unique_id": "voice-unique",
+                        "mime_type": "audio/ogg"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let voice = update.message.unwrap().voice.unwrap();
+        assert_eq!(voice.file_id, "voice-file");
+        assert_eq!(voice.file_unique_id, "voice-unique");
+        assert_eq!(voice.mime_type.as_deref(), Some("audio/ogg"));
+    }
+
+    #[test]
+    fn deserializes_get_file_response() {
+        let file: TelegramFile = serde_json::from_str(
+            r#"{
+                "file_path": "voice/file_123.oga"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(file.file_path.as_deref(), Some("voice/file_123.oga"));
     }
 }

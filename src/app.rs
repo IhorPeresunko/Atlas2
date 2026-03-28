@@ -20,7 +20,9 @@ impl App {
         let config = Config::load(cli)?;
         ensure_database_parent_dir(&config.database_url)?;
         let storage = Storage::connect(&config.database_url).await?;
-        storage.mark_interrupted_app_server_sessions_failed().await?;
+        storage
+            .mark_interrupted_app_server_sessions_failed()
+            .await?;
         let telegram = TelegramClient::new(&config.telegram_api_base, &config.telegram_bot_token);
         let filesystem = FilesystemService::default();
         let codex = CodexClient::new(
@@ -74,7 +76,7 @@ impl App {
                             .telegram
                             .send_message(
                                 chat_id,
-                                "Atlas2 commands:\n/new - select a folder and create a new session\n/sessions - list known sessions\n/plan <prompt> - run a read-only planning turn\nAny other text - send a prompt to the active Codex session",
+                                "Atlas2 commands:\n/new - select a folder and create a new session\n/sessions - list known sessions\n/plan <prompt> - run a read-only planning turn\nAny other text - send a prompt to the active Codex session\nUse the Stop button on a running turn to interrupt it.",
                                 None,
                                 None,
                             )
@@ -193,6 +195,12 @@ impl App {
                 self.services
                     .resolve_approval(approval_id, chat_id, user_id, false)
                     .await
+            } else if let Some(id) = data.strip_prefix("turn-stop:") {
+                let session_id =
+                    crate::domain::SessionId(uuid::Uuid::parse_str(id).map_err(|error| {
+                        AppError::Validation(format!("invalid session ID in callback: {error}"))
+                    })?);
+                self.services.stop_turn(session_id, chat_id, user_id).await
             } else {
                 match self
                     .services

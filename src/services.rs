@@ -23,6 +23,21 @@ use crate::{
 
 const TELEGRAM_TEXT_LIMIT: usize = 3900;
 
+#[derive(Debug, Clone)]
+struct LiveTurnControl {
+    chat_id: TelegramChatId,
+    control_message_id: i64,
+    stop_requested: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnTerminalState {
+    Completed,
+    Interrupted,
+    Stopped,
+    Failed,
+}
+
 #[derive(Clone)]
 pub struct AppServices {
     pub config: Config,
@@ -32,6 +47,7 @@ pub struct AppServices {
     pub codex: CodexClient,
     pub stt: SttClient,
     session_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
+    live_turns: Arc<Mutex<HashMap<SessionId, LiveTurnControl>>>,
 }
 
 impl AppServices {
@@ -51,6 +67,7 @@ impl AppServices {
             codex,
             stt,
             session_locks: Arc::new(Mutex::new(HashMap::new())),
+            live_turns: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -286,9 +303,12 @@ impl AppServices {
             ));
         }
         if approval.status != ApprovalStatus::Pending {
-            return Err(AppError::Validation(
-                "approval request has already been resolved".into(),
-            ));
+            let message = if approval.status == ApprovalStatus::Expired {
+                "approval request is no longer active"
+            } else {
+                "approval request has already been resolved"
+            };
+            return Err(AppError::Validation(message.into()));
         }
 
         let new_status = if approved {
@@ -310,12 +330,59 @@ impl AppServices {
             ApprovalStatus::Approved => "Approval sent to Codex.".into(),
             ApprovalStatus::Rejected => "Rejection sent to Codex.".into(),
             ApprovalStatus::Pending => unreachable!(),
+            ApprovalStatus::Expired => unreachable!(),
         })
     }
 
     pub async fn run_prompt(&self, chat_id: TelegramChatId, prompt: &str) -> AppResult<()> {
         self.run_prompt_with_mode(chat_id, prompt, PromptMode::Normal)
             .await
+    }
+
+    pub async fn stop_turn(
+        &self,
+        session_id: SessionId,
+        chat_id: TelegramChatId,
+        user_id: TelegramUserId,
+    ) -> AppResult<String> {
+        self.require_group_admin(chat_id, user_id).await?;
+
+        let session = self.require_active_session(chat_id).await?;
+        if session.session_id != session_id {
+            return Err(AppError::Validation("turn is no longer active".into()));
+        }
+
+        {
+            let mut live_turns = self.live_turns.lock().await;
+            let live_turn = live_turns
+                .get_mut(&session_id)
+                .ok_or_else(|| AppError::Validation("turn is no longer running".into()))?;
+            if live_turn.chat_id != chat_id {
+                return Err(AppError::Validation(
+                    "turn belongs to a different chat".into(),
+                ));
+            }
+            if live_turn.stop_requested {
+                return Err(AppError::Validation(
+                    "turn stop is already in progress".into(),
+                ));
+            }
+            live_turn.stop_requested = true;
+        }
+
+        if let Err(error) = self.codex.stop_turn(&session_id).await {
+            let mut live_turns = self.live_turns.lock().await;
+            if let Some(live_turn) = live_turns.get_mut(&session_id) {
+                live_turn.stop_requested = false;
+            }
+            return Err(error);
+        }
+
+        self.storage
+            .expire_pending_approvals_for_session(&session_id)
+            .await?;
+
+        Ok("Stopping Codex turn.".into())
     }
 
     pub async fn run_plan_prompt(&self, chat_id: TelegramChatId, prompt: &str) -> AppResult<()> {
@@ -385,6 +452,23 @@ impl AppServices {
         self.storage
             .update_session_status(&session.session_id, SessionStatus::Running, None)
             .await?;
+        let control_message = self
+            .telegram
+            .send_message(
+                chat_id,
+                "Codex turn running.",
+                None,
+                Some(turn_control_markup(&session.session_id)),
+            )
+            .await?;
+        self.live_turns.lock().await.insert(
+            session.session_id.clone(),
+            LiveTurnControl {
+                chat_id,
+                control_message_id: control_message.message_id,
+                stop_requested: false,
+            },
+        );
         let telegram = self.telegram.clone();
         let storage = self.storage.clone();
         let session_id = session.session_id.clone();
@@ -485,6 +569,9 @@ impl AppServices {
                         });
                     }
                     CodexEvent::TurnCompleted => {}
+                    CodexEvent::TurnInterrupted { message } => {
+                        let _ = message;
+                    }
                     CodexEvent::TurnFailed { message } => {
                         send_text_update(
                             &event_updates_tx,
@@ -502,6 +589,20 @@ impl AppServices {
 
         match result {
             Ok(result) => {
+                let live_turn = self.live_turns.lock().await.remove(&session.session_id);
+                let terminal_state = match &live_turn {
+                    Some(live_turn) if live_turn.stop_requested => TurnTerminalState::Stopped,
+                    Some(_) if result.interrupted => TurnTerminalState::Interrupted,
+                    Some(_) if result.failure.is_some() => TurnTerminalState::Failed,
+                    Some(_) => TurnTerminalState::Completed,
+                    None if result.interrupted => TurnTerminalState::Interrupted,
+                    None if result.failure.is_some() => TurnTerminalState::Failed,
+                    None => TurnTerminalState::Completed,
+                };
+                if let Some(live_turn) = live_turn {
+                    self.finish_turn_control(live_turn, terminal_state, result.failure.as_deref())
+                        .await?;
+                }
                 if let Some(thread_id) = result.thread_id.as_ref() {
                     self.storage
                         .update_session_provider_state(
@@ -511,7 +612,13 @@ impl AppServices {
                         )
                         .await?;
                 }
-                if let Some(message) = result.failure {
+                if terminal_state == TurnTerminalState::Stopped
+                    || terminal_state == TurnTerminalState::Interrupted
+                {
+                    self.storage
+                        .update_session_status(&session.session_id, SessionStatus::Ready, None)
+                        .await?;
+                } else if let Some(message) = result.failure {
                     self.storage
                         .update_session_status(
                             &session.session_id,
@@ -527,6 +634,16 @@ impl AppServices {
                 Ok(())
             }
             Err(error) => {
+                let live_turn = self.live_turns.lock().await.remove(&session.session_id);
+                if let Some(live_turn) = live_turn {
+                    let _ = self
+                        .finish_turn_control(
+                            live_turn,
+                            TurnTerminalState::Failed,
+                            Some(&error.to_string()),
+                        )
+                        .await;
+                }
                 self.storage
                     .update_session_status(
                         &session.session_id,
@@ -564,6 +681,24 @@ impl AppServices {
                 )
             })
     }
+
+    async fn finish_turn_control(
+        &self,
+        live_turn: LiveTurnControl,
+        state: TurnTerminalState,
+        detail: Option<&str>,
+    ) -> AppResult<()> {
+        self.telegram
+            .edit_message_text(
+                live_turn.chat_id,
+                live_turn.control_message_id,
+                &render_turn_terminal_text(state, detail),
+                None,
+                None,
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 pub enum FolderCallbackResult {
@@ -577,6 +712,24 @@ fn trim_for_telegram(text: &str) -> String {
         "Working...".into()
     } else {
         trimmed
+    }
+}
+
+fn turn_control_markup(session_id: &SessionId) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::single_column(vec![button("Stop", format!("turn-stop:{}", session_id.0))])
+}
+
+fn render_turn_terminal_text(state: TurnTerminalState, detail: Option<&str>) -> String {
+    match state {
+        TurnTerminalState::Completed => "Codex turn completed.".into(),
+        TurnTerminalState::Interrupted => "Codex turn interrupted.".into(),
+        TurnTerminalState::Stopped => "Codex turn stopped.".into(),
+        TurnTerminalState::Failed => match detail {
+            Some(detail) if !detail.is_empty() => {
+                trim_for_telegram(&format!("Codex turn failed.\n{detail}"))
+            }
+            _ => "Codex turn failed.".into(),
+        },
     }
 }
 
@@ -875,11 +1028,12 @@ fn split_path_suffix(path: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use crate::{
-        domain::PromptMode,
+        domain::{PromptMode, SessionId},
         services::{
-            TELEGRAM_TEXT_LIMIT, TelegramTurnUpdate, build_codex_prompt, compact_text_for_telegram,
-            render_command_finished_message, render_voice_transcript_message,
-            send_clear_status_update, send_status_update, send_text_update, trim_for_telegram,
+            TELEGRAM_TEXT_LIMIT, TelegramTurnUpdate, TurnTerminalState, build_codex_prompt,
+            compact_text_for_telegram, render_command_finished_message, render_turn_terminal_text,
+            render_voice_transcript_message, send_clear_status_update, send_status_update,
+            send_text_update, trim_for_telegram, turn_control_markup,
         },
         telegram::ParseMode,
     };
@@ -959,6 +1113,26 @@ mod tests {
         let TelegramTurnUpdate::ClearStatus = update else {
             panic!("expected clear status update");
         };
+    }
+
+    #[test]
+    fn turn_control_markup_uses_stop_callback() {
+        let session_id = SessionId::new();
+        let markup = turn_control_markup(&session_id);
+
+        assert_eq!(markup.inline_keyboard.len(), 1);
+        assert_eq!(markup.inline_keyboard[0][0].text, "Stop");
+        assert_eq!(
+            markup.inline_keyboard[0][0].callback_data,
+            format!("turn-stop:{}", session_id.0)
+        );
+    }
+
+    #[test]
+    fn stopped_turn_terminal_text_is_stable() {
+        let text = render_turn_terminal_text(TurnTerminalState::Stopped, None);
+
+        assert_eq!(text, "Codex turn stopped.");
     }
 
     #[test]

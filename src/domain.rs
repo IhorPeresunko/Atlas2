@@ -135,6 +135,7 @@ pub enum ApprovalStatus {
     Pending,
     Approved,
     Rejected,
+    Expired,
 }
 
 impl ApprovalStatus {
@@ -143,6 +144,7 @@ impl ApprovalStatus {
             ApprovalStatus::Pending => "pending",
             ApprovalStatus::Approved => "approved",
             ApprovalStatus::Rejected => "rejected",
+            ApprovalStatus::Expired => "expired",
         }
     }
 
@@ -151,6 +153,7 @@ impl ApprovalStatus {
             "pending" => Some(Self::Pending),
             "approved" => Some(Self::Approved),
             "rejected" => Some(Self::Rejected),
+            "expired" => Some(Self::Expired),
             _ => None,
         }
     }

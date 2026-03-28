@@ -12,6 +12,7 @@ Each Telegram group has one active Codex session at a time. A group admin runs `
 - Telegram `voice` messages transcribed through ElevenLabs STT when enabled
 - `/plan <prompt>` for a read-only planning turn
 - streamed progress/output back into Telegram as separate messages
+- Stop button for live Codex turns
 - approval buttons when exposed by the Codex event stream
 - SQLite-backed session and approval state
 - Telegram-created sessions persist a provider thread ID so they can be resumed through Codex CLI
@@ -55,6 +56,7 @@ cargo run -- --stt-provider 11labs --stt-api-key sk_...
 6. Send a Telegram voice message to have Atlas2 transcribe it and forward the transcript to Codex.
 7. Use `/plan <prompt>` when you want a plan-only turn without file changes.
 8. Use `/sessions` to list known sessions.
+9. Use the `Stop` button on a running turn to interrupt the live Codex execution.
 
 ## Notes
 

@@ -17,6 +17,7 @@
 - `/plan <prompt>` runs a plan-only Codex turn for the current session.
 - Any non-command text in a group with an active session is treated as a prompt for Codex.
 - Telegram `voice` messages in a group with an active session should be transcribed and treated as prompts for Codex when STT is enabled.
+- Live turns should expose a Telegram `Stop` button so admins can interrupt them in-place.
 
 ## Folder Selection
 
@@ -47,15 +48,18 @@
 - Each streamed Codex chunk should be sent as its own Telegram message in arrival order.
 - Progress updates, command execution output, and agent text should each be reflected as separate Telegram messages.
 - Approval requests should be posted as separate messages with inline buttons.
+- Running turns should also expose a separate inline control message with a `Stop` button.
 
 ## Approval Flow
 
 - Atlas2 should surface Codex approval/action requests as Telegram buttons whenever the Codex event stream exposes them.
 - Group admins can approve or reject via Telegram buttons.
+- Group admins can also stop a running turn via Telegram buttons.
 - Approval decisions must be persisted in SQLite.
 - Invalid, stale, or repeated approval clicks must be rejected safely.
 - Approval decisions should continue the live app-server turn when the runtime is still active.
 - After an Atlas2 restart, previously pending approval buttons may become stale and must be rejected safely.
+- After a live turn is stopped, approval buttons from that turn must become stale and be rejected safely.
 
 ## Runtime and Distribution
 

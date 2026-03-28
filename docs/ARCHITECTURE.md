@@ -26,6 +26,7 @@ Atlas2 is a single-process Rust service that connects Telegram groups to Codex C
    - create a fresh session on `/new`
    - list sessions
    - submit normal or plan-mode prompts to Codex
+   - stop a live Codex turn
    - download and transcribe voice prompts before routing them through the normal prompt path
    - resolve approval actions
 5. The filesystem service validates and canonicalizes workspace paths before session creation.
@@ -37,6 +38,7 @@ Atlas2 is a single-process Rust service that connects Telegram groups to Codex C
    - ordered progress/output messages, one per streamed chunk
    - transcript echo messages for accepted voice prompts
    - command completion messages rendered with Telegram expandable formatting for large output
+   - turn control messages with an inline Stop button while a turn is active
    - approval messages with inline buttons
 10. SQLite persists enough state for restart recovery.
 
@@ -81,8 +83,9 @@ SQLite currently stores:
 - Selecting a folder replaces the folder-browser message with `Started new session in X`.
 - Groups stream Codex output as separate bot messages, preserving event order.
 - Command completions are posted as formatted Telegram messages with the command summary visible and command output collapsed by default.
+- Each live turn also gets a separate control message with a `Stop` button. When the turn finishes or is interrupted, Atlas2 edits that control message into a terminal status and removes the button.
 - Approval requests are posted as separate messages with inline buttons.
-- Only Telegram group admins may create sessions or resolve approvals.
+- Only Telegram group admins may create sessions, resolve approvals, or stop a running turn.
 
 ## Codex Integration Model
 
@@ -94,6 +97,7 @@ SQLite currently stores:
 - Atlas2 currently maps these app-server events into Telegram-facing domain events:
   - thread started
   - turn started/completed/failed
+  - turn interrupted
   - agent message deltas
   - command execution started/completed and output deltas
   - approval requests with in-process approve/reject continuation

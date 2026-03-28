@@ -1,4 +1,12 @@
-use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use serde_json::{Value, json};
 use tokio::{
@@ -92,6 +100,9 @@ impl CodexClient {
                     CodexEvent::TurnCompleted => {
                         result.completed = true;
                     }
+                    CodexEvent::TurnInterrupted { .. } => {
+                        result.interrupted = true;
+                    }
                     CodexEvent::TurnFailed { message } => {
                         result.failure = Some(message.clone());
                     }
@@ -100,7 +111,7 @@ impl CodexClient {
 
                 on_event(event.clone())?;
 
-                if result.completed || result.failure.is_some() {
+                if result.completed || result.interrupted || result.failure.is_some() {
                     break;
                 }
             }
@@ -138,6 +149,17 @@ impl CodexClient {
             })?;
         runtime.resolve_approval(approval_id, approved).await
     }
+
+    pub async fn stop_turn(&self, session_id: &SessionId) -> AppResult<()> {
+        let runtime = self
+            .runtimes
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| AppError::Validation("Codex turn is no longer running".into()))?;
+        runtime.interrupt_turn().await
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -145,6 +167,7 @@ pub struct CodexTurnResult {
     pub thread_id: Option<CodexThreadId>,
     pub resume_cursor_json: Option<String>,
     pub completed: bool,
+    pub interrupted: bool,
     pub failure: Option<String>,
 }
 
@@ -172,6 +195,9 @@ pub enum CodexEvent {
         approval: CodexPendingApproval,
     },
     TurnCompleted,
+    TurnInterrupted {
+        message: String,
+    },
     TurnFailed {
         message: String,
     },
@@ -256,12 +282,16 @@ impl AppServerRuntime {
             oneshot::Sender<AppResult<Value>>,
         >::new()));
         let command_outputs = Arc::new(Mutex::new(HashMap::<String, String>::new()));
-        let approvals = Arc::new(Mutex::new(HashMap::<ApprovalId, PendingApprovalRequest>::new()));
+        let approvals = Arc::new(Mutex::new(
+            HashMap::<ApprovalId, PendingApprovalRequest>::new(),
+        ));
         let handle = Arc::new(LiveRuntimeHandle {
             approvals,
             sender: sender.clone(),
             session_id,
             current_thread_id: Mutex::new(None),
+            current_turn_id: Mutex::new(None),
+            next_request_id: AtomicU64::new(1_000_000),
         });
 
         let stdout_task = tokio::spawn(read_stdout_loop(
@@ -327,9 +357,12 @@ impl AppServerRuntime {
         let result = if let Some(thread_id) = provider_thread_id {
             self.send_request(
                 "thread/resume",
-                merge_objects(params, json!({
-                    "threadId": thread_id.0,
-                })),
+                merge_objects(
+                    params,
+                    json!({
+                        "threadId": thread_id.0,
+                    }),
+                ),
             )
             .await?
         } else {
@@ -345,11 +378,10 @@ impl AppServerRuntime {
     }
 
     async fn start_turn(&mut self, prompt: &str, mode: PromptMode) -> AppResult<()> {
-        let thread_id = self
-            .handle
-            .latest_thread_id()
-            .await
-            .ok_or_else(|| AppError::Codex("missing provider thread id for turn start".into()))?;
+        let thread_id =
+            self.handle.latest_thread_id().await.ok_or_else(|| {
+                AppError::Codex("missing provider thread id for turn start".into())
+            })?;
 
         let turn_prompt = build_codex_prompt(prompt, mode);
         let mut params = json!({
@@ -432,9 +464,10 @@ impl AppServerRuntime {
                 })
                 .to_string(),
             )
-            .map_err(|_| AppError::Codex(format!("failed to send app-server notification {method}")))
+            .map_err(|_| {
+                AppError::Codex(format!("failed to send app-server notification {method}"))
+            })
     }
-
 }
 
 #[derive(Debug)]
@@ -443,6 +476,8 @@ struct LiveRuntimeHandle {
     sender: mpsc::UnboundedSender<String>,
     session_id: SessionId,
     current_thread_id: Mutex<Option<CodexThreadId>>,
+    current_turn_id: Mutex<Option<String>>,
+    next_request_id: AtomicU64,
 }
 
 impl LiveRuntimeHandle {
@@ -478,6 +513,42 @@ impl LiveRuntimeHandle {
 
     async fn set_thread_id(&self, thread_id: Option<CodexThreadId>) {
         *self.current_thread_id.lock().await = thread_id;
+    }
+
+    async fn latest_turn_id(&self) -> Option<String> {
+        self.current_turn_id.lock().await.clone()
+    }
+
+    async fn set_turn_id(&self, turn_id: Option<String>) {
+        *self.current_turn_id.lock().await = turn_id;
+    }
+
+    async fn interrupt_turn(&self) -> AppResult<()> {
+        let thread_id = self.latest_thread_id().await.ok_or_else(|| {
+            AppError::Validation("Codex turn is not ready to be interrupted yet".into())
+        })?;
+        let turn_id = self.latest_turn_id().await.ok_or_else(|| {
+            AppError::Validation("Codex turn is not ready to be interrupted yet".into())
+        })?;
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        self.sender
+            .send(
+                json!({
+                    "id": request_id,
+                    "method": "turn/interrupt",
+                    "params": {
+                        "threadId": thread_id.0,
+                        "turnId": turn_id,
+                    }
+                })
+                .to_string(),
+            )
+            .map_err(|_| {
+                AppError::Codex(format!(
+                    "failed to interrupt Codex turn for session {}",
+                    self.session_id.0
+                ))
+            })
     }
 }
 
@@ -521,8 +592,19 @@ async fn read_stdout_loop(
             if let Some(event) =
                 map_notification(&method, &params, &command_outputs, &text_outputs).await
             {
-                if let CodexEvent::ThreadStarted { thread_id, .. } = &event {
-                    handle.set_thread_id(Some(thread_id.clone())).await;
+                match &event {
+                    CodexEvent::ThreadStarted { thread_id, .. } => {
+                        handle.set_thread_id(Some(thread_id.clone())).await;
+                    }
+                    CodexEvent::Status { .. } if method == "turn/started" => {
+                        handle.set_turn_id(extract_turn_id(&params)).await;
+                    }
+                    CodexEvent::TurnCompleted
+                    | CodexEvent::TurnInterrupted { .. }
+                    | CodexEvent::TurnFailed { .. } => {
+                        handle.set_turn_id(None).await;
+                    }
+                    _ => {}
                 }
                 let _ = event_tx.send(event);
             }
@@ -660,7 +742,16 @@ async fn map_notification(
                 .and_then(|turn| turn.get("status"))
                 .and_then(Value::as_str)
                 .unwrap_or("completed");
-            if status == "failed" || status == "cancelled" || status == "interrupted" {
+            if status == "interrupted" || status == "cancelled" {
+                let message = params
+                    .get("turn")
+                    .and_then(|turn| turn.get("error"))
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex turn interrupted")
+                    .to_string();
+                Some(CodexEvent::TurnInterrupted { message })
+            } else if status == "failed" {
                 let message = params
                     .get("turn")
                     .and_then(|turn| turn.get("error"))
@@ -726,7 +817,11 @@ async fn map_item_completed(
     match item_type {
         "agentMessage" => {
             let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
-            let buffered = text_outputs.lock().await.remove(item_id).unwrap_or_default();
+            let buffered = text_outputs
+                .lock()
+                .await
+                .remove(item_id)
+                .unwrap_or_default();
             let text = if buffered.is_empty() {
                 item.get("text")
                     .and_then(Value::as_str)
@@ -805,10 +900,12 @@ fn summarize_approval_request(method: &str, params: &Value) -> String {
 }
 
 fn extract_thread_id(value: &Value) -> Option<CodexThreadId> {
-    value.get("threadId")
+    value
+        .get("threadId")
         .and_then(Value::as_str)
         .or_else(|| {
-            value.get("thread")
+            value
+                .get("thread")
                 .and_then(|thread| thread.get("id"))
                 .and_then(Value::as_str)
         })
@@ -822,6 +919,19 @@ fn build_resume_cursor_json(value: &Value) -> Option<String> {
         })
         .to_string()
     })
+}
+
+fn extract_turn_id(value: &Value) -> Option<String> {
+    value
+        .get("turnId")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
 }
 
 fn merge_objects(base: Value, overlay: Value) -> Value {
@@ -856,8 +966,8 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use super::{
-        CodexEvent, build_resume_cursor_json, extract_thread_id, map_item_completed,
-        summarize_approval_request,
+        CodexEvent, build_resume_cursor_json, extract_thread_id, extract_turn_id,
+        map_item_completed, map_notification, summarize_approval_request,
     };
 
     #[test]
@@ -876,6 +986,15 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(cursor, r#"{"threadId":"thread_123"}"#);
+    }
+
+    #[test]
+    fn extracts_turn_id_from_turn_notifications() {
+        let turn_id = extract_turn_id(&json!({
+            "turn": {"id": "turn_123"}
+        }))
+        .unwrap();
+        assert_eq!(turn_id, "turn_123");
     }
 
     #[test]
@@ -948,6 +1067,34 @@ mod tests {
                 assert_eq!(command, "pwd");
                 assert_eq!(exit_code, 0);
                 assert_eq!(output, "/tmp/project\n");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn maps_interrupted_turn_completion_to_interrupted_event() {
+        let command_outputs = Arc::new(Mutex::new(HashMap::new()));
+        let text_outputs = Arc::new(Mutex::new(HashMap::new()));
+
+        let event = map_notification(
+            "turn/completed",
+            &json!({
+                "turn": {
+                    "id": "turn_123",
+                    "status": "interrupted",
+                    "error": { "message": "Stopped by user" }
+                }
+            }),
+            &command_outputs,
+            &text_outputs,
+        )
+        .await
+        .expect("interrupted turn event");
+
+        match event {
+            CodexEvent::TurnInterrupted { message } => {
+                assert_eq!(message, "Stopped by user");
             }
             other => panic!("unexpected event: {other:?}"),
         }

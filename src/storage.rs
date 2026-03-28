@@ -3,9 +3,9 @@ use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 
 use crate::{
     domain::{
-        ApprovalId, ApprovalStatus, ChatBinding, CodexThreadId, FolderBrowseState,
-        PendingApproval, SessionBackend, SessionId, SessionRecord, SessionStatus, SessionSummary,
-        TelegramChatId, TelegramUserId, WorkspacePath,
+        ApprovalId, ApprovalStatus, ChatBinding, CodexThreadId, FolderBrowseState, PendingApproval,
+        SessionBackend, SessionId, SessionRecord, SessionStatus, SessionSummary, TelegramChatId,
+        TelegramUserId, WorkspacePath,
     },
     error::{AppError, AppResult},
 };
@@ -101,9 +101,11 @@ impl Storage {
             return Ok(());
         }
 
-        sqlx::query(&format!("ALTER TABLE sessions ADD COLUMN {name} {definition}"))
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(&format!(
+            "ALTER TABLE sessions ADD COLUMN {name} {definition}"
+        ))
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -398,6 +400,24 @@ impl Storage {
         .await?;
         Ok(())
     }
+
+    pub async fn expire_pending_approvals_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            UPDATE pending_approvals
+            SET status = 'expired'
+            WHERE session_id = ?1
+              AND status = 'pending'
+            "#,
+        )
+        .bind(session_id.0.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 fn map_chat_binding(row: sqlx::sqlite::SqliteRow) -> AppResult<ChatBinding> {
@@ -487,8 +507,8 @@ mod tests {
 
     use super::Storage;
     use crate::domain::{
-        ChatBinding, CodexThreadId, SessionBackend, SessionId, SessionRecord, SessionStatus,
-        TelegramChatId, WorkspacePath,
+        ApprovalId, ApprovalStatus, ChatBinding, CodexThreadId, PendingApproval, SessionBackend,
+        SessionId, SessionRecord, SessionStatus, TelegramChatId, WorkspacePath,
     };
 
     #[tokio::test]
@@ -568,5 +588,47 @@ mod tests {
             .unwrap();
         assert_eq!(updated.status, SessionStatus::Failed);
         assert!(updated.last_error.unwrap().contains("Atlas2 restarted"));
+    }
+
+    #[tokio::test]
+    async fn expires_pending_approvals_for_session() {
+        let storage = Storage::connect("sqlite::memory:").await.unwrap();
+        let session = SessionRecord {
+            session_id: SessionId::new(),
+            chat_id: TelegramChatId(14),
+            workspace_path: WorkspacePath("/tmp/project".into()),
+            backend: SessionBackend::AppServer,
+            provider_thread_id: None,
+            resume_cursor_json: None,
+            status: SessionStatus::WaitingForApproval,
+            last_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        storage.insert_session(&session).await.unwrap();
+
+        let approval = PendingApproval {
+            approval_id: ApprovalId::new(),
+            session_id: session.session_id.clone(),
+            chat_id: session.chat_id,
+            payload: "{}".into(),
+            summary: "Need approval".into(),
+            status: ApprovalStatus::Pending,
+            created_at: Utc::now(),
+            resolved_by: None,
+        };
+        storage.insert_pending_approval(&approval).await.unwrap();
+
+        storage
+            .expire_pending_approvals_for_session(&session.session_id)
+            .await
+            .unwrap();
+
+        let updated = storage
+            .get_pending_approval(&approval.approval_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, ApprovalStatus::Expired);
     }
 }

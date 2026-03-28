@@ -67,47 +67,76 @@ impl App {
                 .map(|user| TelegramUserId(user.id))
                 .ok_or_else(|| AppError::Validation("message missing sender".into()))?;
 
-            match text.as_str() {
-                "/start" | "/help" => {
+            match parse_message_text(&text) {
+                IncomingMessage::Help => {
                     self.services
                         .telegram
                         .send_message(
                             chat_id,
-                            "Atlas2 commands:\n/new - select a folder and create a new session\n/sessions - list known sessions\nAny other text - send a prompt to the active Codex session",
+                            "Atlas2 commands:\n/new - select a folder and create a new session\n/sessions - list known sessions\n/plan <prompt> - run a read-only planning turn\nAny other text - send a prompt to the active Codex session",
+                            None,
                             None,
                         )
                         .await?;
                 }
-                "/new" => {
+                IncomingMessage::NewSession => {
                     self.services.require_group_admin(chat_id, user_id).await?;
                     let text = self.services.begin_folder_selection(chat_id).await?;
                     let markup = self.services.folder_markup("/").await?;
                     self.services
                         .telegram
-                        .send_message(chat_id, &text, Some(markup))
+                        .send_message(chat_id, &text, None, Some(markup))
                         .await?;
                 }
-                "/sessions" => {
+                IncomingMessage::Sessions => {
                     let summary = self.services.render_sessions().await?;
                     self.services
                         .telegram
-                        .send_message(chat_id, &summary, None)
+                        .send_message(chat_id, &summary, None, None)
                         .await?;
                 }
-                other if other.starts_with('/') => {
+                IncomingMessage::Plan(prompt) => {
+                    let prompt = prompt.to_string();
+                    let services = self.services.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = services.run_plan_prompt(chat_id, &prompt).await {
+                            let _ = services
+                                .telegram
+                                .send_message(
+                                    chat_id,
+                                    &format!("Prompt failed: {error}"),
+                                    None,
+                                    None,
+                                )
+                                .await;
+                        }
+                    });
+                }
+                IncomingMessage::PlanUsage => {
                     self.services
                         .telegram
-                        .send_message(chat_id, "Unknown command.", None)
+                        .send_message(chat_id, "Usage: /plan <prompt>", None, None)
                         .await?;
                 }
-                prompt => {
+                IncomingMessage::UnknownCommand => {
+                    self.services
+                        .telegram
+                        .send_message(chat_id, "Unknown command.", None, None)
+                        .await?;
+                }
+                IncomingMessage::Prompt(prompt) => {
                     let prompt = prompt.to_string();
                     let services = self.services.clone();
                     tokio::spawn(async move {
                         if let Err(error) = services.run_prompt(chat_id, &prompt).await {
                             let _ = services
                                 .telegram
-                                .send_message(chat_id, &format!("Prompt failed: {error}"), None)
+                                .send_message(
+                                    chat_id,
+                                    &format!("Prompt failed: {error}"),
+                                    None,
+                                    None,
+                                )
                                 .await;
                         }
                     });
@@ -149,14 +178,14 @@ impl App {
                     FolderCallbackResult::Render(text, markup) => {
                         self.services
                             .telegram
-                            .edit_message_text(chat_id, message.message_id, &text, Some(markup))
+                            .edit_message_text(chat_id, message.message_id, &text, None, Some(markup))
                             .await?;
                         Ok("Updated folder browser.".into())
                     }
                     FolderCallbackResult::Replace(text) => {
                         self.services
                             .telegram
-                            .edit_message_text(chat_id, message.message_id, &text, None)
+                            .edit_message_text(chat_id, message.message_id, &text, None, None)
                             .await?;
                         Ok(text)
                     }
@@ -177,6 +206,47 @@ impl App {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IncomingMessage<'a> {
+    Help,
+    NewSession,
+    Sessions,
+    Plan(&'a str),
+    PlanUsage,
+    UnknownCommand,
+    Prompt(&'a str),
+}
+
+fn parse_message_text(text: &str) -> IncomingMessage<'_> {
+    match text {
+        "/start" | "/help" => IncomingMessage::Help,
+        "/new" => IncomingMessage::NewSession,
+        "/sessions" => IncomingMessage::Sessions,
+        "/plan" => IncomingMessage::PlanUsage,
+        _ => {
+            if let Some(prompt) = text.strip_prefix("/plan ") {
+                let prompt = prompt.trim();
+                if prompt.is_empty() {
+                    IncomingMessage::PlanUsage
+                } else {
+                    IncomingMessage::Plan(prompt)
+                }
+            } else if let Some(prompt) = text.strip_prefix("/plan\n") {
+                let prompt = prompt.trim();
+                if prompt.is_empty() {
+                    IncomingMessage::PlanUsage
+                } else {
+                    IncomingMessage::Plan(prompt)
+                }
+            } else if text.starts_with('/') {
+                IncomingMessage::UnknownCommand
+            } else {
+                IncomingMessage::Prompt(text)
+            }
+        }
+    }
+}
+
 fn ensure_database_parent_dir(database_url: &str) -> AppResult<()> {
     let path = database_url
         .strip_prefix("sqlite://")
@@ -186,4 +256,23 @@ fn ensure_database_parent_dir(database_url: &str) -> AppResult<()> {
         std::fs::create_dir_all(parent)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IncomingMessage, parse_message_text};
+
+    #[test]
+    fn parses_plan_command_with_inline_prompt() {
+        assert_eq!(
+            parse_message_text("/plan inspect the session flow"),
+            IncomingMessage::Plan("inspect the session flow")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_plan_command() {
+        assert_eq!(parse_message_text("/plan"), IncomingMessage::PlanUsage);
+        assert_eq!(parse_message_text("/plan   "), IncomingMessage::PlanUsage);
+    }
 }

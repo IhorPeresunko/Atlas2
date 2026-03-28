@@ -4,7 +4,7 @@ Atlas2 is a single-process Rust service that connects Telegram groups to Codex C
 
 ## Runtime Shape
 
-- The process starts locally and prompts for the Telegram bot token if one is not already present in the process environment.
+- The process starts locally and loads the Telegram bot token from the environment or a local persisted token file, prompting only when neither source is available.
 - The service depends on a locally installed and authenticated `codex` binary.
 - Telegram updates arrive through long polling.
 - SQLite stores durable state in a local file.
@@ -23,13 +23,14 @@ Atlas2 is a single-process Rust service that connects Telegram groups to Codex C
    - navigate/select/cancel folder browsing
    - create a fresh session on `/new`
    - list sessions
-   - submit prompts to Codex
+   - submit normal or plan-mode prompts to Codex
    - resolve approval actions
 5. The filesystem service validates and canonicalizes workspace paths before session creation.
 6. The Codex adapter spawns `codex exec --json` or `codex exec resume <thread_id>` in the selected workspace and translates JSONL events into internal domain events.
 7. The Telegram adapter reflects those events back into Telegram:
    - folder browser message edits
-   - live progress/output message edits
+  - ordered progress/output messages, one per streamed chunk
+  - command completion messages rendered with Telegram expandable formatting for large output
    - approval messages with inline buttons
 8. SQLite persists enough state for restart recovery.
 
@@ -66,9 +67,11 @@ SQLite currently stores:
 ## Telegram Interaction Model
 
 - `/new` creates a folder browser rooted at `/`.
+- `/plan <prompt>` sends a read-only planning turn for the active session.
 - Folder navigation uses compact callback tokens rather than raw full paths in callback data, because Telegram callback payload size is limited.
 - Selecting a folder replaces the folder-browser message with `Started new session in X`.
-- Groups stream Codex output by editing a live message.
+- Groups stream Codex output as separate bot messages, preserving event order.
+- Command completions are posted as formatted Telegram messages with the command summary visible and command output collapsed by default.
 - Approval requests are posted as separate messages with inline buttons.
 - Only Telegram group admins may create sessions or resolve approvals.
 
@@ -77,6 +80,7 @@ SQLite currently stores:
 - The first prompt after `/new` starts a fresh Codex session.
 - Later prompts reuse the stored Codex thread ID and call `codex exec resume`.
 - The selected workspace directory becomes the Codex working directory.
+- Plan-mode turns are expressed by Atlas2 as plan-only prompt instructions plus a read-only Codex sandbox.
 - Atlas2 currently parses these exec-mode event classes:
   - thread started
   - turn started/completed/failed

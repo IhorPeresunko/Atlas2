@@ -12,6 +12,12 @@ pub struct TelegramClient {
     base_url: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ParseMode {
+    #[serde(rename = "HTML")]
+    Html,
+}
+
 impl TelegramClient {
     pub fn new(api_base: &str, bot_token: &str) -> Self {
         let base_url = format!("{}/bot{}", api_base.trim_end_matches('/'), bot_token);
@@ -41,12 +47,16 @@ impl TelegramClient {
         &self,
         chat_id: TelegramChatId,
         text: &str,
+        parse_mode: Option<ParseMode>,
         reply_markup: Option<InlineKeyboardMarkup>,
     ) -> AppResult<Message> {
         let mut payload = json!({
             "chat_id": chat_id.0,
             "text": text,
         });
+        if let Some(parse_mode) = parse_mode {
+            payload["parse_mode"] = serde_json::to_value(parse_mode)?;
+        }
         if let Some(markup) = reply_markup {
             payload["reply_markup"] = serde_json::to_value(markup)?;
         }
@@ -58,6 +68,7 @@ impl TelegramClient {
         chat_id: TelegramChatId,
         message_id: i64,
         text: &str,
+        parse_mode: Option<ParseMode>,
         reply_markup: Option<InlineKeyboardMarkup>,
     ) -> AppResult<Message> {
         let mut payload = json!({
@@ -65,24 +76,13 @@ impl TelegramClient {
             "message_id": message_id,
             "text": text,
         });
+        if let Some(parse_mode) = parse_mode {
+            payload["parse_mode"] = serde_json::to_value(parse_mode)?;
+        }
         if let Some(markup) = reply_markup {
             payload["reply_markup"] = serde_json::to_value(markup)?;
         }
         self.call("editMessageText", &payload).await
-    }
-
-    pub async fn send_message_draft(
-        &self,
-        chat_id: TelegramChatId,
-        draft_id: i64,
-        text: &str,
-    ) -> AppResult<bool> {
-        let payload = json!({
-            "chat_id": chat_id.0,
-            "draft_id": draft_id,
-            "text": text,
-        });
-        self.call("sendMessageDraft", &payload).await
     }
 
     pub async fn answer_callback_query(

@@ -39,6 +39,29 @@ pub struct WorkspacePath(pub String);
 pub struct CodexThreadId(pub String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionBackend {
+    ExecLegacy,
+    AppServer,
+}
+
+impl SessionBackend {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionBackend::ExecLegacy => "exec_legacy",
+            SessionBackend::AppServer => "app_server",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "exec_legacy" => Some(Self::ExecLegacy),
+            "app_server" => Some(Self::AppServer),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptMode {
     Normal,
     Plan,
@@ -57,8 +80,11 @@ pub struct SessionRecord {
     pub session_id: SessionId,
     pub chat_id: TelegramChatId,
     pub workspace_path: WorkspacePath,
-    pub codex_thread_id: Option<CodexThreadId>,
+    pub backend: SessionBackend,
+    pub provider_thread_id: Option<CodexThreadId>,
+    pub resume_cursor_json: Option<String>,
     pub status: SessionStatus,
+    pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -149,7 +175,9 @@ pub struct SessionSummary {
     pub chat_id: TelegramChatId,
     pub chat_title: Option<String>,
     pub workspace_path: WorkspacePath,
+    pub backend: SessionBackend,
     pub status: SessionStatus,
-    pub codex_thread_id: Option<CodexThreadId>,
+    pub provider_thread_id: Option<CodexThreadId>,
+    pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
 }

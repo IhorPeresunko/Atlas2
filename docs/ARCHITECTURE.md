@@ -31,7 +31,7 @@ Atlas2 is a single-process Rust service that connects Telegram groups to Codex C
 5. The filesystem service validates and canonicalizes workspace paths before session creation.
 6. The Telegram adapter fetches file metadata and downloads voice-note payloads when a Telegram `voice` message is received.
 7. The STT adapter uploads the audio payload to ElevenLabs and returns a transcript string.
-8. The Codex adapter spawns `codex exec --json` or `codex exec resume <thread_id>` in the selected workspace and translates JSONL events into internal domain events.
+8. The Codex adapter spawns `codex app-server --session-source cli` over stdio, initializes JSON-RPC, starts or resumes the provider thread for the active Atlas session, and translates app-server notifications and requests into internal domain events.
 9. The Telegram adapter reflects those events back into Telegram:
    - folder browser message edits
    - ordered progress/output messages, one per streamed chunk
@@ -49,7 +49,7 @@ Atlas2 is a single-process Rust service that connects Telegram groups to Codex C
 - `telegram`
   - Owns Bot API transport, long polling, callback answers, admin lookup, and message send/edit operations.
 - `codex`
-  - Owns Codex CLI invocation and JSONL event parsing.
+  - Owns Codex CLI app-server invocation, JSON-RPC transport, live approval routing, and event mapping.
 - `stt`
   - Owns speech-to-text provider selection and ElevenLabs transcription requests.
 - `filesystem`
@@ -66,7 +66,7 @@ SQLite currently stores:
 - chats
   - Telegram chat identity, kind, title, and the active session binding
 - sessions
-  - Atlas2 session ID, chat binding, workspace path, Codex thread ID, and runtime status
+  - Atlas2 session ID, chat binding, workspace path, backend marker, provider thread ID, resume cursor, runtime status, and last error
 - folder_browse_state
   - Current directory being browsed for each chat during `/new`
 - pending_approvals
@@ -87,15 +87,16 @@ SQLite currently stores:
 ## Codex Integration Model
 
 - The first prompt after `/new` starts a fresh Codex session.
-- Later prompts reuse the stored Codex thread ID and call `codex exec resume`.
+- Later prompts spawn a fresh `codex app-server` process and resume the stored provider thread ID.
 - The selected workspace directory becomes the Codex working directory.
-- Plan-mode turns are expressed by Atlas2 as plan-only prompt instructions plus a read-only Codex sandbox.
-- Atlas2 currently parses these exec-mode event classes:
+- Plan-mode turns are expressed by Atlas2 as plan-only prompt instructions plus a read-only app-server sandbox policy.
+- Atlas2 uses one live app-server process per active Telegram turn. The process stays alive while a turn is running or waiting for approval, then is shut down once the turn reaches a stable idle state.
+- Atlas2 currently maps these app-server events into Telegram-facing domain events:
   - thread started
   - turn started/completed/failed
-  - agent message output
-  - command execution started/completed
-  - approval requested when exposed by the stream
+  - agent message deltas
+  - command execution started/completed and output deltas
+  - approval requests with in-process approve/reject continuation
 
 ## Constraints and Known Limits
 
@@ -104,5 +105,5 @@ SQLite currently stores:
 - Prompts are serialized per group with a per-chat mutex to preserve isolation.
 - Voice prompts use the same per-chat serialization as text prompts so transcription and execution cannot overlap within one group.
 - Folder selection must complete successfully before a session is created.
-- Atlas2 persists approval decisions, but full automatic continuation of an interrupted approval-bound exec turn is still limited by the current Codex exec-mode contract.
+- Atlas2 persists provider thread state and approval decisions, but does not recover in-flight app-server turns across Atlas2 restarts. Interrupted running or waiting sessions are marked failed at startup and can be resumed by sending a new prompt.
 - Atlas2 is currently optimized for a single local instance using SQLite, not multi-instance coordination.

@@ -2,7 +2,7 @@
 
 Atlas2 connects Telegram groups to local Codex CLI sessions.
 
-Each Telegram group has one active Codex session at a time. A group admin runs `/new`, selects a working directory on the host, and then sends prompts in the group. Atlas2 streams Codex output back into Telegram as separate progress messages and stores session state in SQLite.
+Each Telegram group has one active Codex session at a time. A group admin runs `/new`, selects a working directory on the host, and then sends prompts in the group. Atlas2 uses `codex app-server --session-source cli`, streams Codex output back into Telegram as separate progress messages, and stores session state in SQLite.
 
 ## Current Features
 
@@ -14,6 +14,7 @@ Each Telegram group has one active Codex session at a time. A group admin runs `
 - streamed progress/output back into Telegram as separate messages
 - approval buttons when exposed by the Codex event stream
 - SQLite-backed session and approval state
+- Telegram-created sessions persist a provider thread ID so they can be resumed through Codex CLI
 
 ## Run
 
@@ -59,5 +60,5 @@ cargo run -- --stt-provider 11labs --stt-api-key sk_...
 
 - Atlas2 is designed as a local binary, not a Docker-first app.
 - SQLite is the default persistence backend.
-- Approval decisions are recorded, but fully automatic continuation of an interrupted approval-bound exec turn is not complete yet.
+- Approval decisions continue the live app-server turn while Atlas2 is running.
 # atlas2

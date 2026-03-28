@@ -33,7 +33,8 @@
 
 - Atlas2 uses the local `codex` binary on the host machine.
 - A fresh session starts on the first prompt after `/new`.
-- Follow-up prompts resume the stored Codex thread using `codex exec resume <thread_id>`.
+- Follow-up prompts resume the stored Codex provider thread through `codex app-server`.
+- New Atlas2 sessions should use `codex app-server --session-source cli` so Telegram-originated work is resumable from normal Codex CLI history.
 - Codex runs with the selected workspace as its working directory.
 - Plan-mode turns must always be available through Telegram and must be routed as read-only planning requests rather than normal execution turns.
 - Session metadata must persist across restarts in SQLite.
@@ -53,7 +54,8 @@
 - Group admins can approve or reject via Telegram buttons.
 - Approval decisions must be persisted in SQLite.
 - Invalid, stale, or repeated approval clicks must be rejected safely.
-- Current limitation: Atlas2 records the approval decision, but fully automatic continuation of the interrupted exec-mode turn is not yet available through the current `codex exec --json` integration. The next prompt continues the workflow.
+- Approval decisions should continue the live app-server turn when the runtime is still active.
+- After an Atlas2 restart, previously pending approval buttons may become stale and must be rejected safely.
 
 ## Runtime and Distribution
 
@@ -71,7 +73,7 @@
 - SQLite stores:
   - Telegram chat metadata
   - active session bindings
-  - session records
+  - session records, including backend marker, provider thread ID, resume cursor, and last error
   - folder browser state
   - pending approvals
 - Data should survive process restarts.
@@ -81,5 +83,5 @@
 
 - Atlas2 does not yet support rebinding a group to an older existing session.
 - Atlas2 does not yet support a separate control chat outside the group workflow.
-- Atlas2 does not yet implement a fully resumable approval continuation loop inside a single paused exec turn.
+- Atlas2 does not recover an in-flight app-server turn across an Atlas2 process restart; the next prompt resumes from the last saved provider thread state instead.
 - Atlas2 does not currently restrict folder browsing to an allowlist of roots.

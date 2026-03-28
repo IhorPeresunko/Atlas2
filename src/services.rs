@@ -12,7 +12,8 @@ use crate::{
     config::Config,
     domain::{
         ApprovalId, ApprovalStatus, FolderBrowseState, PendingApproval, PromptMode, SessionId,
-        SessionRecord, SessionStatus, TelegramChatId, TelegramUserId, WorkspacePath,
+        SessionBackend, SessionRecord, SessionStatus, TelegramChatId, TelegramUserId,
+        WorkspacePath,
     },
     error::{AppError, AppResult},
     filesystem::FilesystemService,
@@ -153,8 +154,11 @@ impl AppServices {
                     session_id: SessionId::new(),
                     chat_id,
                     workspace_path: workspace.clone(),
-                    codex_thread_id: None,
+                    backend: SessionBackend::AppServer,
+                    provider_thread_id: None,
+                    resume_cursor_json: None,
                     status: SessionStatus::Ready,
+                    last_error: None,
                     created_at: now,
                     updated_at: now,
                 };
@@ -246,14 +250,15 @@ impl AppServices {
                 .chat_title
                 .unwrap_or_else(|| session.chat_id.0.to_string());
             let thread = session
-                .codex_thread_id
+                .provider_thread_id
                 .map(|id| id.0)
                 .unwrap_or_else(|| "not started".into());
             lines.push(format!(
-                "- {} | chat={} | workspace={} | status={} | thread={}",
+                "- {} | chat={} | workspace={} | backend={} | status={} | thread={}",
                 session.session_id.0,
                 title,
                 session.workspace_path.0,
+                session.backend.as_str(),
                 session.status.as_str(),
                 thread
             ));
@@ -292,19 +297,22 @@ impl AppServices {
         } else {
             ApprovalStatus::Rejected
         };
+        self.codex
+            .resolve_approval(&approval.session_id, &approval_id, approved)
+            .await?;
         self.storage
             .resolve_approval(&approval_id, new_status.clone(), user_id)
             .await?;
         self.storage
-            .update_session_runtime(&approval.session_id, SessionStatus::Ready, None)
+            .update_session_status(&approval.session_id, SessionStatus::Running, None)
             .await?;
 
         Ok(match new_status {
             ApprovalStatus::Approved => {
-                "Approval recorded. Automatic continuation is not yet supported by exec-mode Codex; send the next prompt to continue.".into()
+                "Approval sent to Codex.".into()
             }
             ApprovalStatus::Rejected => {
-                "Rejection recorded. Send the next prompt to continue with different instructions.".into()
+                "Rejection sent to Codex.".into()
             }
             ApprovalStatus::Pending => unreachable!(),
         })
@@ -373,9 +381,14 @@ impl AppServices {
     ) -> AppResult<()> {
         let _chat_binding = self.storage.get_chat(chat_id).await?;
         let session = self.require_active_session(chat_id).await?;
+        if session.backend != SessionBackend::AppServer {
+            return Err(AppError::Validation(
+                "this session was created before the app-server migration and cannot continue; run /new to start a fresh session".into(),
+            ));
+        }
 
         self.storage
-            .update_session_runtime(&session.session_id, SessionStatus::Running, None)
+            .update_session_status(&session.session_id, SessionStatus::Running, None)
             .await?;
         let telegram = self.telegram.clone();
         let storage = self.storage.clone();
@@ -388,33 +401,35 @@ impl AppServices {
             }
         });
 
-        send_text_update(&telegram_updates_tx, "Starting Codex turn...");
+        send_status_update(&telegram_updates_tx, "Starting Codex turn...");
         let event_updates_tx = telegram_updates_tx.clone();
 
         let result = self
             .codex
             .run_turn(
-                &session.workspace_path.0,
-                session.codex_thread_id.as_ref(),
-                &build_codex_prompt(prompt, mode),
+                &session,
+                prompt,
                 mode,
                 move |event| {
                     match event {
-                        CodexEvent::ThreadStarted { thread_id } => {
+                        CodexEvent::ThreadStarted {
+                            thread_id,
+                            resume_cursor_json,
+                        } => {
                             let storage = storage.clone();
                             let session_id = session_id.clone();
                             tokio::spawn(async move {
                                 let _ = storage
-                                    .update_session_runtime(
+                                    .update_session_provider_state(
                                         &session_id,
-                                        SessionStatus::Running,
                                         Some(&thread_id),
+                                        resume_cursor_json.as_deref(),
                                     )
                                     .await;
                             });
                         }
                         CodexEvent::Status { text } => {
-                            send_text_update(&event_updates_tx, format!("Status: {text}"));
+                            send_status_update(&event_updates_tx, format!("Status: {text}"));
                         }
                         CodexEvent::Output { text } => {
                             send_text_update(&event_updates_tx, text);
@@ -440,6 +455,13 @@ impl AppServices {
                             let session_id = session_id.clone();
                             let telegram_updates_tx = event_updates_tx.clone();
                             tokio::spawn(async move {
+                                let _ = storage
+                                    .update_session_status(
+                                        &session_id,
+                                        SessionStatus::WaitingForApproval,
+                                        None,
+                                    )
+                                    .await;
                                 let pending = PendingApproval {
                                     approval_id: approval.approval_id.clone(),
                                     session_id,
@@ -487,24 +509,33 @@ impl AppServices {
 
         match result {
             Ok(result) => {
-                if let Some(thread_id) = result.thread_id {
+                if let Some(thread_id) = result.thread_id.as_ref() {
                     self.storage
-                        .update_session_runtime(
+                        .update_session_provider_state(
                             &session.session_id,
-                            SessionStatus::Ready,
                             Some(&thread_id),
+                            result.resume_cursor_json.as_deref(),
                         )
+                        .await?;
+                }
+                if let Some(message) = result.failure {
+                    self.storage
+                        .update_session_status(&session.session_id, SessionStatus::Failed, Some(&message))
                         .await?;
                 } else {
                     self.storage
-                        .update_session_runtime(&session.session_id, SessionStatus::Ready, None)
+                        .update_session_status(&session.session_id, SessionStatus::Ready, None)
                         .await?;
                 }
                 Ok(())
             }
             Err(error) => {
                 self.storage
-                    .update_session_runtime(&session.session_id, SessionStatus::Failed, None)
+                    .update_session_status(
+                        &session.session_id,
+                        SessionStatus::Failed,
+                        Some(&error.to_string()),
+                    )
                     .await?;
                 let message = format!("Codex execution failed: {error}");
                 self.telegram
@@ -561,12 +592,13 @@ enum TelegramTurnUpdate {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TelegramMessage {
     text: String,
     parse_mode: Option<ParseMode>,
 }
 
+#[cfg(test)]
 fn build_codex_prompt(prompt: &str, mode: PromptMode) -> String {
     match mode {
         PromptMode::Normal => prompt.to_string(),
@@ -591,6 +623,20 @@ fn render_voice_transcript_message(transcript: &str) -> String {
 }
 
 fn send_text_update(
+    telegram_updates_tx: &UnboundedSender<TelegramTurnUpdate>,
+    text: impl Into<String>,
+) {
+    send_plain_update(telegram_updates_tx, text);
+}
+
+fn send_status_update(
+    telegram_updates_tx: &UnboundedSender<TelegramTurnUpdate>,
+    text: impl Into<String>,
+) {
+    send_plain_update(telegram_updates_tx, text);
+}
+
+fn send_plain_update(
     telegram_updates_tx: &UnboundedSender<TelegramTurnUpdate>,
     text: impl Into<String>,
 ) {
@@ -773,9 +819,9 @@ mod tests {
     use crate::{
         domain::PromptMode,
         services::{
-            TELEGRAM_TEXT_LIMIT, TelegramTurnUpdate, build_codex_prompt, compact_text_for_telegram,
-            render_command_finished_message, render_voice_transcript_message, send_text_update,
-            trim_for_telegram,
+            TELEGRAM_TEXT_LIMIT, TelegramTurnUpdate, build_codex_prompt,
+            compact_text_for_telegram, render_command_finished_message,
+            render_voice_transcript_message, send_text_update, trim_for_telegram,
         },
         telegram::ParseMode,
     };

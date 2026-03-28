@@ -20,6 +20,7 @@ impl App {
         let config = Config::load(cli)?;
         ensure_database_parent_dir(&config.database_url)?;
         let storage = Storage::connect(&config.database_url).await?;
+        storage.mark_interrupted_app_server_sessions_failed().await?;
         let telegram = TelegramClient::new(&config.telegram_api_base, &config.telegram_bot_token);
         let filesystem = FilesystemService::default();
         let codex = CodexClient::new(

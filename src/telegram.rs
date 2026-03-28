@@ -89,6 +89,21 @@ impl TelegramClient {
         self.call("editMessageText", &payload).await
     }
 
+    pub async fn delete_message(
+        &self,
+        chat_id: TelegramChatId,
+        message_id: i64,
+    ) -> AppResult<bool> {
+        self.call(
+            "deleteMessage",
+            &json!({
+                "chat_id": chat_id.0,
+                "message_id": message_id,
+            }),
+        )
+        .await
+    }
+
     pub async fn answer_callback_query(
         &self,
         callback_query_id: &str,

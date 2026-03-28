@@ -11,9 +11,8 @@ use crate::{
     codex::{CodexClient, CodexEvent},
     config::Config,
     domain::{
-        ApprovalId, ApprovalStatus, FolderBrowseState, PendingApproval, PromptMode, SessionId,
-        SessionBackend, SessionRecord, SessionStatus, TelegramChatId, TelegramUserId,
-        WorkspacePath,
+        ApprovalId, ApprovalStatus, FolderBrowseState, PendingApproval, PromptMode, SessionBackend,
+        SessionId, SessionRecord, SessionStatus, TelegramChatId, TelegramUserId, WorkspacePath,
     },
     error::{AppError, AppResult},
     filesystem::FilesystemService,
@@ -308,12 +307,8 @@ impl AppServices {
             .await?;
 
         Ok(match new_status {
-            ApprovalStatus::Approved => {
-                "Approval sent to Codex.".into()
-            }
-            ApprovalStatus::Rejected => {
-                "Rejection sent to Codex.".into()
-            }
+            ApprovalStatus::Approved => "Approval sent to Codex.".into(),
+            ApprovalStatus::Rejected => "Rejection sent to Codex.".into(),
             ApprovalStatus::Pending => unreachable!(),
         })
     }
@@ -396,8 +391,10 @@ impl AppServices {
         let chat_id_copy = chat_id;
         let (telegram_updates_tx, mut telegram_updates_rx) = unbounded_channel();
         let telegram_sender = tokio::spawn(async move {
+            let mut delivery_state = TelegramTurnDeliveryState::default();
             while let Some(update) = telegram_updates_rx.recv().await {
-                let _ = send_telegram_update(&telegram, chat_id_copy, update).await;
+                let _ = send_telegram_update(&telegram, chat_id_copy, &mut delivery_state, update)
+                    .await;
             }
         });
 
@@ -406,104 +403,100 @@ impl AppServices {
 
         let result = self
             .codex
-            .run_turn(
-                &session,
-                prompt,
-                mode,
-                move |event| {
-                    match event {
-                        CodexEvent::ThreadStarted {
-                            thread_id,
-                            resume_cursor_json,
-                        } => {
-                            let storage = storage.clone();
-                            let session_id = session_id.clone();
-                            tokio::spawn(async move {
-                                let _ = storage
-                                    .update_session_provider_state(
-                                        &session_id,
-                                        Some(&thread_id),
-                                        resume_cursor_json.as_deref(),
-                                    )
-                                    .await;
-                            });
-                        }
-                        CodexEvent::Status { text } => {
-                            send_status_update(&event_updates_tx, format!("Status: {text}"));
-                        }
-                        CodexEvent::Output { text } => {
-                            send_text_update(&event_updates_tx, text);
-                        }
-                        CodexEvent::CommandStarted { command } => {
-                            send_text_update(
-                                &event_updates_tx,
-                                format!("Running command:\n`{command}`"),
-                            );
-                        }
-                        CodexEvent::CommandFinished {
-                            command,
-                            exit_code,
-                            output,
-                        } => {
-                            send_command_finished_update(
-                                &event_updates_tx,
-                                render_command_finished_message(&command, exit_code, &output),
-                            );
-                        }
-                        CodexEvent::ApprovalRequested { approval } => {
-                            let storage = storage.clone();
-                            let session_id = session_id.clone();
-                            let telegram_updates_tx = event_updates_tx.clone();
-                            tokio::spawn(async move {
-                                let _ = storage
-                                    .update_session_status(
-                                        &session_id,
-                                        SessionStatus::WaitingForApproval,
-                                        None,
-                                    )
-                                    .await;
-                                let pending = PendingApproval {
-                                    approval_id: approval.approval_id.clone(),
-                                    session_id,
-                                    chat_id: chat_id_copy,
-                                    payload: approval.payload,
-                                    summary: approval.summary,
-                                    status: ApprovalStatus::Pending,
-                                    created_at: Utc::now(),
-                                    resolved_by: None,
-                                };
-                                let _ = storage.insert_pending_approval(&pending).await;
-                                let markup = InlineKeyboardMarkup {
-                                    inline_keyboard: vec![vec![
-                                        button(
-                                            "Approve",
-                                            format!("approval-approve:{}", pending.approval_id.0),
-                                        ),
-                                        button(
-                                            "Reject",
-                                            format!("approval-reject:{}", pending.approval_id.0),
-                                        ),
-                                    ]],
-                                };
-                                let _ = telegram_updates_tx.send(TelegramTurnUpdate::Approval {
-                                    summary: pending.summary,
-                                    markup,
-                                });
-                            });
-                        }
-                        CodexEvent::TurnCompleted => {}
-                        CodexEvent::TurnFailed { message } => {
-                            send_text_update(
-                                &event_updates_tx,
-                                format!("Codex turn failed: {message}"),
-                            );
-                        }
+            .run_turn(&session, prompt, mode, move |event| {
+                match event {
+                    CodexEvent::ThreadStarted {
+                        thread_id,
+                        resume_cursor_json,
+                    } => {
+                        let storage = storage.clone();
+                        let session_id = session_id.clone();
+                        tokio::spawn(async move {
+                            let _ = storage
+                                .update_session_provider_state(
+                                    &session_id,
+                                    Some(&thread_id),
+                                    resume_cursor_json.as_deref(),
+                                )
+                                .await;
+                        });
                     }
-                    Ok(())
-                },
-            )
+                    CodexEvent::Status { text } => {
+                        send_status_update(&event_updates_tx, format!("Status: {text}"));
+                    }
+                    CodexEvent::Output { text } => {
+                        send_text_update(&event_updates_tx, text);
+                    }
+                    CodexEvent::CommandStarted { command } => {
+                        send_text_update(
+                            &event_updates_tx,
+                            format!("Running command:\n`{command}`"),
+                        );
+                    }
+                    CodexEvent::CommandFinished {
+                        command,
+                        exit_code,
+                        output,
+                    } => {
+                        send_command_finished_update(
+                            &event_updates_tx,
+                            render_command_finished_message(&command, exit_code, &output),
+                        );
+                    }
+                    CodexEvent::ApprovalRequested { approval } => {
+                        let storage = storage.clone();
+                        let session_id = session_id.clone();
+                        let telegram_updates_tx = event_updates_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = storage
+                                .update_session_status(
+                                    &session_id,
+                                    SessionStatus::WaitingForApproval,
+                                    None,
+                                )
+                                .await;
+                            let pending = PendingApproval {
+                                approval_id: approval.approval_id.clone(),
+                                session_id,
+                                chat_id: chat_id_copy,
+                                payload: approval.payload,
+                                summary: approval.summary,
+                                status: ApprovalStatus::Pending,
+                                created_at: Utc::now(),
+                                resolved_by: None,
+                            };
+                            let _ = storage.insert_pending_approval(&pending).await;
+                            let markup = InlineKeyboardMarkup {
+                                inline_keyboard: vec![vec![
+                                    button(
+                                        "Approve",
+                                        format!("approval-approve:{}", pending.approval_id.0),
+                                    ),
+                                    button(
+                                        "Reject",
+                                        format!("approval-reject:{}", pending.approval_id.0),
+                                    ),
+                                ]],
+                            };
+                            let _ = telegram_updates_tx.send(TelegramTurnUpdate::Approval {
+                                summary: pending.summary,
+                                markup,
+                            });
+                        });
+                    }
+                    CodexEvent::TurnCompleted => {}
+                    CodexEvent::TurnFailed { message } => {
+                        send_text_update(
+                            &event_updates_tx,
+                            format!("Codex turn failed: {message}"),
+                        );
+                    }
+                }
+                Ok(())
+            })
             .await;
 
+        send_clear_status_update(&telegram_updates_tx);
         drop(telegram_updates_tx);
         let _ = telegram_sender.await;
 
@@ -520,7 +513,11 @@ impl AppServices {
                 }
                 if let Some(message) = result.failure {
                     self.storage
-                        .update_session_status(&session.session_id, SessionStatus::Failed, Some(&message))
+                        .update_session_status(
+                            &session.session_id,
+                            SessionStatus::Failed,
+                            Some(&message),
+                        )
                         .await?;
                 } else {
                     self.storage
@@ -585,7 +582,9 @@ fn trim_for_telegram(text: &str) -> String {
 
 #[derive(Debug)]
 enum TelegramTurnUpdate {
+    Status(TelegramMessage),
     Message(TelegramMessage),
+    ClearStatus,
     Approval {
         summary: String,
         markup: InlineKeyboardMarkup,
@@ -596,6 +595,12 @@ enum TelegramTurnUpdate {
 struct TelegramMessage {
     text: String,
     parse_mode: Option<ParseMode>,
+}
+
+#[derive(Debug, Default)]
+struct TelegramTurnDeliveryState {
+    transient_status_message_id: Option<i64>,
+    transient_status_text: Option<String>,
 }
 
 #[cfg(test)]
@@ -633,7 +638,15 @@ fn send_status_update(
     telegram_updates_tx: &UnboundedSender<TelegramTurnUpdate>,
     text: impl Into<String>,
 ) {
-    send_plain_update(telegram_updates_tx, text);
+    let compact = compact_text_for_telegram(&text.into());
+    let _ = telegram_updates_tx.send(TelegramTurnUpdate::Status(TelegramMessage {
+        text: trim_for_telegram(&compact),
+        parse_mode: None,
+    }));
+}
+
+fn send_clear_status_update(telegram_updates_tx: &UnboundedSender<TelegramTurnUpdate>) {
+    let _ = telegram_updates_tx.send(TelegramTurnUpdate::ClearStatus);
 }
 
 fn send_plain_update(
@@ -657,20 +670,65 @@ fn send_command_finished_update(
 async fn send_telegram_update(
     telegram: &TelegramClient,
     chat_id: TelegramChatId,
+    delivery_state: &mut TelegramTurnDeliveryState,
     update: TelegramTurnUpdate,
 ) -> AppResult<()> {
     match update {
+        TelegramTurnUpdate::Status(message) => {
+            upsert_status_message(telegram, chat_id, delivery_state, message).await?;
+        }
         TelegramTurnUpdate::Message(message) => {
+            clear_status_message(telegram, chat_id, delivery_state).await?;
             telegram
                 .send_message(chat_id, &message.text, message.parse_mode, None)
                 .await?;
         }
+        TelegramTurnUpdate::ClearStatus => {
+            clear_status_message(telegram, chat_id, delivery_state).await?;
+        }
         TelegramTurnUpdate::Approval { summary, markup } => {
+            clear_status_message(telegram, chat_id, delivery_state).await?;
             telegram
                 .send_message(chat_id, &summary, None, Some(markup))
                 .await?;
         }
     }
+    Ok(())
+}
+
+async fn upsert_status_message(
+    telegram: &TelegramClient,
+    chat_id: TelegramChatId,
+    delivery_state: &mut TelegramTurnDeliveryState,
+    message: TelegramMessage,
+) -> AppResult<()> {
+    if let Some(message_id) = delivery_state.transient_status_message_id {
+        if delivery_state.transient_status_text.as_deref() == Some(message.text.as_str()) {
+            return Ok(());
+        }
+        telegram
+            .edit_message_text(chat_id, message_id, &message.text, message.parse_mode, None)
+            .await?;
+    } else {
+        let sent = telegram
+            .send_message(chat_id, &message.text, message.parse_mode, None)
+            .await?;
+        delivery_state.transient_status_message_id = Some(sent.message_id);
+    }
+
+    delivery_state.transient_status_text = Some(message.text);
+    Ok(())
+}
+
+async fn clear_status_message(
+    telegram: &TelegramClient,
+    chat_id: TelegramChatId,
+    delivery_state: &mut TelegramTurnDeliveryState,
+) -> AppResult<()> {
+    if let Some(message_id) = delivery_state.transient_status_message_id.take() {
+        let _ = telegram.delete_message(chat_id, message_id).await?;
+    }
+    delivery_state.transient_status_text = None;
     Ok(())
 }
 
@@ -819,9 +877,9 @@ mod tests {
     use crate::{
         domain::PromptMode,
         services::{
-            TELEGRAM_TEXT_LIMIT, TelegramTurnUpdate, build_codex_prompt,
-            compact_text_for_telegram, render_command_finished_message,
-            render_voice_transcript_message, send_text_update, trim_for_telegram,
+            TELEGRAM_TEXT_LIMIT, TelegramTurnUpdate, build_codex_prompt, compact_text_for_telegram,
+            render_command_finished_message, render_voice_transcript_message,
+            send_clear_status_update, send_status_update, send_text_update, trim_for_telegram,
         },
         telegram::ParseMode,
     };
@@ -875,6 +933,32 @@ mod tests {
         };
         assert_eq!(message.text, "Working...");
         assert_eq!(message.parse_mode, None);
+    }
+
+    #[test]
+    fn queued_status_updates_use_status_variant() {
+        let (tx, mut rx) = unbounded_channel();
+
+        send_status_update(&tx, "Codex turn started");
+
+        let update = rx.try_recv().expect("queued update");
+        let TelegramTurnUpdate::Status(message) = update else {
+            panic!("expected status update");
+        };
+        assert_eq!(message.text, "Codex turn started");
+        assert_eq!(message.parse_mode, None);
+    }
+
+    #[test]
+    fn queued_clear_status_updates_use_clear_variant() {
+        let (tx, mut rx) = unbounded_channel();
+
+        send_clear_status_update(&tx);
+
+        let update = rx.try_recv().expect("queued update");
+        let TelegramTurnUpdate::ClearStatus = update else {
+            panic!("expected clear status update");
+        };
     }
 
     #[test]

@@ -82,6 +82,7 @@ SQLite currently stores:
 - Folder navigation uses compact callback tokens rather than raw full paths in callback data, because Telegram callback payload size is limited.
 - Selecting a folder replaces the folder-browser message with `Started new session in X`.
 - Groups stream Codex output as separate bot messages, preserving event order.
+- When a plain-text message exceeds Telegram's `sendMessage` size limit, the Telegram adapter splits it into ordered chunks before delivery.
 - Command completions are posted as formatted Telegram messages with the command summary visible and command output collapsed by default.
 - Each live turn also gets a separate control message with a `Stop` button. When the turn finishes or is interrupted, Atlas2 edits that control message into a terminal status and removes the button.
 - Approval requests are posted as separate messages with inline buttons.

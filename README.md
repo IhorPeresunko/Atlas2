@@ -12,6 +12,7 @@ Each Telegram group has one active Codex session at a time. A group admin runs `
 - Telegram `voice` messages transcribed through ElevenLabs STT when enabled
 - `/plan <prompt>` for a read-only planning turn
 - streamed progress/output back into Telegram as separate messages
+- long plain-text outputs split across multiple Telegram messages when needed
 - Stop button for live Codex turns
 - approval buttons when exposed by the Codex event stream
 - SQLite-backed session and approval state

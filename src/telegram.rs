@@ -6,6 +6,8 @@ use crate::{
     error::{AppError, AppResult},
 };
 
+const TELEGRAM_TEXT_LIMIT: usize = 4096;
+
 #[derive(Clone)]
 pub struct TelegramClient {
     http: reqwest::Client,
@@ -54,17 +56,29 @@ impl TelegramClient {
         parse_mode: Option<ParseMode>,
         reply_markup: Option<InlineKeyboardMarkup>,
     ) -> AppResult<Message> {
-        let mut payload = json!({
-            "chat_id": chat_id.0,
-            "text": text,
-        });
-        if let Some(parse_mode) = parse_mode {
-            payload["parse_mode"] = serde_json::to_value(parse_mode)?;
+        let chunks = split_message_text(text, parse_mode);
+        let mut sent_messages = Vec::with_capacity(chunks.len());
+
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let mut payload = json!({
+                "chat_id": chat_id.0,
+                "text": chunk,
+            });
+            if let Some(parse_mode) = parse_mode {
+                payload["parse_mode"] = serde_json::to_value(parse_mode)?;
+            }
+            if index == 0 {
+                if let Some(markup) = reply_markup.as_ref() {
+                    payload["reply_markup"] = serde_json::to_value(markup)?;
+                }
+            }
+            sent_messages.push(self.call("sendMessage", &payload).await?);
         }
-        if let Some(markup) = reply_markup {
-            payload["reply_markup"] = serde_json::to_value(markup)?;
-        }
-        self.call("sendMessage", &payload).await
+
+        sent_messages
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Telegram("telegram sendMessage produced no chunks".into()))
     }
 
     pub async fn edit_message_text(
@@ -75,6 +89,7 @@ impl TelegramClient {
         parse_mode: Option<ParseMode>,
         reply_markup: Option<InlineKeyboardMarkup>,
     ) -> AppResult<Message> {
+        let text = trim_message_text(text, parse_mode);
         let mut payload = json!({
             "chat_id": chat_id.0,
             "message_id": message_id,
@@ -180,6 +195,80 @@ impl TelegramClient {
     }
 }
 
+fn split_message_text(text: &str, parse_mode: Option<ParseMode>) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    if parse_mode.is_some() {
+        return vec![trim_message_text(text, parse_mode)];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        if remaining.chars().count() <= TELEGRAM_TEXT_LIMIT {
+            chunks.push(remaining.to_string());
+            break;
+        }
+
+        let split_at = find_split_index(remaining, TELEGRAM_TEXT_LIMIT);
+        let (chunk, rest) = remaining.split_at(split_at);
+        chunks.push(chunk.to_string());
+        remaining = rest;
+    }
+
+    chunks
+}
+
+fn trim_message_text(text: &str, parse_mode: Option<ParseMode>) -> String {
+    let char_count = text.chars().count();
+    if char_count <= TELEGRAM_TEXT_LIMIT {
+        return text.to_string();
+    }
+
+    let mut trimmed = String::new();
+    let target = TELEGRAM_TEXT_LIMIT.saturating_sub(3);
+    let mut trimmed_chars = 0;
+    for ch in text.chars() {
+        if trimmed_chars >= target {
+            break;
+        }
+        trimmed.push(ch);
+        trimmed_chars += 1;
+    }
+
+    if parse_mode.is_some() {
+        // HTML messages are expected to be pre-rendered safely upstream.
+        return trimmed;
+    }
+
+    trimmed.push_str("...");
+    trimmed
+}
+
+fn find_split_index(text: &str, max_chars: usize) -> usize {
+    let mut candidate = None;
+    let mut char_count = 0;
+
+    for (byte_index, ch) in text.char_indices() {
+        if char_count == max_chars {
+            break;
+        }
+        char_count += 1;
+        if ch == '\n' || ch.is_whitespace() {
+            candidate = Some(byte_index + ch.len_utf8());
+        }
+    }
+
+    candidate.unwrap_or_else(|| {
+        text.char_indices()
+            .nth(max_chars)
+            .map(|(index, _)| index)
+            .unwrap_or(text.len())
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct TelegramEnvelope<T> {
     ok: bool,
@@ -279,7 +368,10 @@ pub fn button(text: impl Into<String>, callback_data: impl Into<String>) -> Inli
 
 #[cfg(test)]
 mod tests {
-    use super::{TelegramFile, Update};
+    use super::{
+        ParseMode, TELEGRAM_TEXT_LIMIT, TelegramFile, Update, split_message_text,
+        trim_message_text,
+    };
 
     #[test]
     fn deserializes_voice_message_update() {
@@ -316,5 +408,28 @@ mod tests {
         .unwrap();
 
         assert_eq!(file.file_path.as_deref(), Some("voice/file_123.oga"));
+    }
+
+    #[test]
+    fn splits_plain_text_messages_across_chunks() {
+        let text = format!("{}\n{}", "a".repeat(TELEGRAM_TEXT_LIMIT), "b".repeat(64));
+
+        let chunks = split_message_text(&text, None);
+
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].chars().count() <= TELEGRAM_TEXT_LIMIT);
+        assert!(chunks[1].chars().count() <= TELEGRAM_TEXT_LIMIT);
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn trims_formatted_messages_to_single_chunk() {
+        let text = "x".repeat(TELEGRAM_TEXT_LIMIT + 20);
+
+        let chunks = split_message_text(&text, Some(ParseMode::Html));
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], trim_message_text(&text, Some(ParseMode::Html)));
+        assert!(chunks[0].chars().count() <= TELEGRAM_TEXT_LIMIT);
     }
 }

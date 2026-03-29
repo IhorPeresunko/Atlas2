@@ -774,10 +774,10 @@ fn build_codex_prompt(prompt: &str, mode: PromptMode) -> String {
 }
 
 fn render_voice_transcript_message(transcript: &str) -> String {
-    trim_for_telegram(&format!(
+    format!(
         "Transcribed voice message:\n{}",
         compact_text_for_telegram(transcript)
-    ))
+    )
 }
 
 fn send_text_update(
@@ -808,7 +808,11 @@ fn send_plain_update(
 ) {
     let compact = compact_text_for_telegram(&text.into());
     let _ = telegram_updates_tx.send(TelegramTurnUpdate::Message(TelegramMessage {
-        text: trim_for_telegram(&compact),
+        text: if compact.is_empty() {
+            "Working...".into()
+        } else {
+            compact
+        },
         parse_mode: None,
     }));
 }
@@ -1047,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_text_updates_are_trimmed_before_delivery() {
+    fn queued_text_updates_preserve_full_text_before_delivery() {
         let (tx, mut rx) = unbounded_channel();
 
         send_text_update(&tx, "a".repeat(5000));
@@ -1056,7 +1060,7 @@ mod tests {
         let TelegramTurnUpdate::Message(message) = update else {
             panic!("expected message update");
         };
-        assert_eq!(message.text.len(), TELEGRAM_TEXT_LIMIT);
+        assert_eq!(message.text.len(), 5000);
         assert_eq!(message.parse_mode, None);
     }
 

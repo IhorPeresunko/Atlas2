@@ -17,6 +17,7 @@ pub struct TelegramClient {
     http: reqwest::Client,
     base_url: String,
     file_base_url: String,
+    bot_token: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -34,7 +35,16 @@ impl TelegramClient {
             http: reqwest::Client::new(),
             base_url,
             file_base_url,
+            bot_token: bot_token.to_string(),
         }
+    }
+
+    /// Converts an HTTP error into an AppError with the bot token scrubbed.
+    /// reqwest errors include the request URL, which embeds the token in its
+    /// `/bot<token>/` path segment, so the raw error must never reach the logs.
+    fn redact(&self, error: reqwest::Error) -> AppError {
+        let message = error.to_string().replace(&self.bot_token, "<redacted>");
+        AppError::Telegram(format!("telegram request failed: {message}"))
     }
 
     pub async fn get_updates(
@@ -164,7 +174,8 @@ impl TelegramClient {
             .http
             .get(format!("{}/{}", self.file_base_url, file_path))
             .send()
-            .await?;
+            .await
+            .map_err(|error| self.redact(error))?;
 
         if !response.status().is_success() {
             return Err(AppError::Telegram(format!(
@@ -173,7 +184,11 @@ impl TelegramClient {
             )));
         }
 
-        Ok(response.bytes().await?.to_vec())
+        Ok(response
+            .bytes()
+            .await
+            .map_err(|error| self.redact(error))?
+            .to_vec())
     }
 
     async fn call<T: DeserializeOwned>(&self, method: &str, payload: &Value) -> AppResult<T> {
@@ -184,9 +199,11 @@ impl TelegramClient {
                 .post(format!("{}/{}", self.base_url, method))
                 .json(payload)
                 .send()
-                .await?;
+                .await
+                .map_err(|error| self.redact(error))?;
 
-            let envelope: TelegramEnvelope<T> = response.json().await?;
+            let envelope: TelegramEnvelope<T> =
+                response.json().await.map_err(|error| self.redact(error))?;
             if envelope.ok {
                 return envelope.result.ok_or_else(|| {
                     AppError::Telegram(format!("telegram method {method} returned no result"))

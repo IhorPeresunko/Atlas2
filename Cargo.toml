@@ -2,6 +2,9 @@
 name = "atlas2"
 version = "0.1.0"
 edition = "2024"
+description = "Telegram bridge for local Codex sessions"
+repository = "https://github.com/ihorperesunko/atlas2"
+publish = false
 
 [dependencies]
 chrono = { version = "0.4.42", features = ["serde"] }
@@ -22,3 +25,12 @@ uuid = { version = "1.18.1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 tempfile = "3.23.0"
+
+# Not published to crates.io, but still built/released by `dist`.
+[package.metadata.dist]
+dist = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

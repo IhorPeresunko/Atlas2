@@ -27,6 +27,26 @@ Requirements:
 - Rust
 - local `codex` binary installed and logged in
 
+### Install
+
+On a machine without a Rust toolchain, install a prebuilt binary with the
+one-line installer (available once a release has been published):
+
+```bash
+curl -fsSL https://github.com/ihorperesunko/atlas2/releases/latest/download/atlas2-installer.sh | sh
+```
+
+This downloads the right binary for your platform (Linux x86_64, glibc or
+static musl) and installs `atlas2` into `~/.cargo/bin`, adding it to your
+`PATH`. From a checkout with Rust installed you can instead run
+`cargo install --path .`.
+
+Releases are produced by [`dist`](https://opensource.axo.dev/cargo-dist/): push
+a version tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`) and the GitHub
+Actions release workflow builds the binaries and publishes the installer.
+
+### Usage
+
 Atlas2 is controlled through subcommands:
 
 ```bash

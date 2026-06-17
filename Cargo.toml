@@ -3,7 +3,7 @@ name = "atlas2"
 version = "0.1.0"
 edition = "2024"
 description = "Telegram bridge for local Codex sessions"
-repository = "https://github.com/ihorperesunko/atlas2"
+repository = "https://github.com/IhorPeresunko/Atlas2"
 publish = false
 
 [dependencies]

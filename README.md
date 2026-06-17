@@ -33,7 +33,7 @@ On a machine without a Rust toolchain, install a prebuilt binary with the
 one-line installer (available once a release has been published):
 
 ```bash
-curl -fsSL https://github.com/ihorperesunko/atlas2/releases/latest/download/atlas2-installer.sh | sh
+curl -fsSL https://github.com/IhorPeresunko/Atlas2/releases/latest/download/atlas2-installer.sh | sh
 ```
 
 This downloads the right binary for your platform (Linux x86_64, glibc or

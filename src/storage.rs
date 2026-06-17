@@ -1,5 +1,10 @@
+use std::str::FromStr;
+
 use chrono::{DateTime, Utc};
-use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
+use sqlx::{
+    Row, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
 
 use crate::{
     domain::{
@@ -18,9 +23,16 @@ pub struct Storage {
 
 impl Storage {
     pub async fn connect(database_url: &str) -> AppResult<Self> {
+        // Create the database file if it does not exist yet, so a fresh install
+        // (e.g. a new VM with no `data/` directory) works without a manual step.
+        let connect_options = SqliteConnectOptions::from_str(database_url)
+            .map_err(|error| {
+                AppError::Config(format!("invalid database URL '{database_url}': {error}"))
+            })?
+            .create_if_missing(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(database_url)
+            .connect_with(connect_options)
             .await?;
         let storage = Self { pool };
         storage.migrate().await?;

@@ -54,14 +54,27 @@ atlas2 set bottoken <token>   # store the Telegram bot token
 atlas2 start                  # launch in the background and return immediately
 atlas2 status                 # report whether the background process is running
 atlas2 stop                   # stop the background process
+atlas2 upgrade                # update to the latest release, restarting if running
 atlas2 run                    # run in the foreground (blocks the terminal)
 ```
 
 `atlas2 start` spawns a detached background process, writes its PID to `~/.local/state/atlas2/atlas2.pid`, and streams logs to `~/.local/state/atlas2/atlas2.log`. It returns control to your shell right away and the process survives the terminal that launched it. Configure the bot token with `atlas2 set bottoken <token>` first, since a background process cannot prompt for it.
 
+`atlas2 upgrade` downloads the latest GitHub release in place (using the install receipt written by the one-line installer) and restarts the background daemon if it was running. It only works for installs done via the release installer, not `cargo install`.
+
 During development you can run from source with `cargo run -- <command>`, e.g. `cargo run -- run` for a foreground server or `cargo run -- status`.
 
-Atlas2 loads the Telegram bot token from `ATLAS2_TELEGRAM_BOT_TOKEN` when set. Otherwise it reuses a locally persisted token from `~/.local/state/atlas2/telegram_bot_token` by default (the file written by `atlas2 set bottoken`), or prompts once when run in the foreground and saves it there for later restarts. Override the token file path with `ATLAS2_TELEGRAM_BOT_TOKEN_FILE`.
+### Files
+
+Atlas2 follows the XDG base-directory layout (overridable per item via env vars):
+
+| Purpose | Default location | Override |
+| --- | --- | --- |
+| Credentials (bot token, STT key) | `~/.config/atlas2/` | `ATLAS2_TELEGRAM_BOT_TOKEN_FILE`, `ATLAS2_STT_API_KEY_FILE` |
+| SQLite database | `~/.local/share/atlas2/atlas2.sqlite` | `ATLAS2_DATABASE_PATH` |
+| Log + PID files | `~/.local/state/atlas2/` | `XDG_STATE_HOME` |
+
+Atlas2 loads the Telegram bot token from `ATLAS2_TELEGRAM_BOT_TOKEN` when set. Otherwise it reuses the persisted token from `~/.config/atlas2/telegram_bot_token` (the file written by `atlas2 set bottoken`; the pre-0.1.1 `~/.local/state/atlas2/` location is still read as a fallback), or prompts once when run in the foreground and saves it for later restarts.
 
 Enable voice-message transcription with ElevenLabs by passing the flag to `start` or `run`:
 
@@ -70,7 +83,7 @@ atlas2 set sttkey sk_...      # store the ElevenLabs API key
 atlas2 start --stt-provider 11labs
 ```
 
-When `--stt-provider 11labs` is enabled, Atlas2 loads the ElevenLabs API key from `--stt-api-key` when provided. Otherwise it reuses a locally persisted key from `~/.local/state/atlas2/stt_api_key` (the file written by `atlas2 set sttkey`), or prompts once when run in the foreground and saves it there for later restarts. Override the key file path with `ATLAS2_STT_API_KEY_FILE`.
+When `--stt-provider 11labs` is enabled, Atlas2 loads the ElevenLabs API key from `--stt-api-key` when provided. Otherwise it reuses the persisted key from `~/.config/atlas2/stt_api_key` (the file written by `atlas2 set sttkey`), or prompts once when run in the foreground and saves it for later restarts. A key passed to `atlas2 start --stt-api-key` is persisted so the background process can reload it on restart.
 
 You can also provide both flags directly:
 

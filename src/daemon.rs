@@ -11,9 +11,32 @@ use crate::{
 
 const PID_FILE_NAME: &str = "atlas2.pid";
 const LOG_FILE_NAME: &str = "atlas2.log";
+const PROVIDER_FILE_NAME: &str = "serve-provider";
 
 fn pid_file() -> AppResult<PathBuf> {
     Ok(config::state_dir()?.join(PID_FILE_NAME))
+}
+
+fn provider_file() -> AppResult<PathBuf> {
+    Ok(config::state_dir()?.join(PROVIDER_FILE_NAME))
+}
+
+/// Records the STT provider the daemon was launched with, so the daemon can be
+/// faithfully restarted (e.g. after `upgrade`) without the original flags.
+fn persist_serve_provider(provider: CliSttProvider) -> AppResult<()> {
+    let value = match provider {
+        CliSttProvider::None => "none",
+        CliSttProvider::ElevenLabs => "11labs",
+    };
+    fs::write(provider_file()?, value)
+        .map_err(|error| AppError::Config(format!("failed to record serve options: {error}")))
+}
+
+fn read_serve_provider() -> CliSttProvider {
+    match provider_file().and_then(|path| Ok(fs::read_to_string(path).ok())) {
+        Ok(Some(value)) if value.trim() == "11labs" => CliSttProvider::ElevenLabs,
+        _ => CliSttProvider::None,
+    }
 }
 
 pub fn log_file() -> AppResult<PathBuf> {
@@ -74,10 +97,12 @@ pub fn start(args: &ServeArgs) -> AppResult<()> {
             "no Telegram bot token configured; run `atlas2 set bottoken <value>` first".into(),
         ));
     }
-    if args.stt_provider == CliSttProvider::ElevenLabs
-        && args.stt_api_key.is_none()
-        && config::stored_stt_api_key()?.is_none()
-    {
+    // Persist a key passed on the command line so the detached process (and any
+    // later restart/upgrade) can load it from disk rather than the argv.
+    if let Some(key) = &args.stt_api_key {
+        config::set_secret("sttkey", key)?;
+    }
+    if args.stt_provider == CliSttProvider::ElevenLabs && config::stored_stt_api_key()?.is_none() {
         return Err(AppError::Config(
             "--stt-provider 11labs needs an API key; run `atlas2 set sttkey <value>` or pass --stt-api-key".into(),
         ));
@@ -114,9 +139,6 @@ pub fn start(args: &ServeArgs) -> AppResult<()> {
     if args.stt_provider == CliSttProvider::ElevenLabs {
         command.args(["--stt-provider", "11labs"]);
     }
-    if let Some(key) = &args.stt_api_key {
-        command.args(["--stt-api-key", key]);
-    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
@@ -142,6 +164,7 @@ pub fn start(args: &ServeArgs) -> AppResult<()> {
     fs::write(pid_file()?, child.id().to_string()).map_err(|error| {
         AppError::Config(format!("failed to write PID file: {error}"))
     })?;
+    persist_serve_provider(args.stt_provider)?;
 
     println!("Atlas2 started (pid {}).", child.id());
     println!("Logs: {}", log_path.display());
@@ -172,6 +195,48 @@ pub fn status() -> AppResult<()> {
     match running_pid()? {
         Some(pid) => println!("Atlas2 is running (pid {pid})."),
         None => println!("Atlas2 is not running."),
+    }
+    Ok(())
+}
+
+/// Downloads and installs the latest release in place using the dist install
+/// receipt, then restarts the background daemon if it was running.
+pub async fn upgrade() -> AppResult<()> {
+    let was_running = running_pid()?.is_some();
+    let provider = read_serve_provider();
+
+    let current = env!("CARGO_PKG_VERSION");
+    println!("Current version: {current}. Checking for updates...");
+
+    let mut updater = axoupdater::AxoUpdater::new_for("atlas2");
+    updater.load_receipt().map_err(|error| {
+        AppError::Config(format!(
+            "could not read the install receipt (was atlas2 installed via the release installer?): {error}"
+        ))
+    })?;
+
+    // Install the update before touching the running daemon: if it fails, the
+    // old binary and the live daemon are left untouched.
+    match updater.run().await {
+        Ok(Some(result)) => {
+            println!("Upgraded to {}.", result.new_version);
+        }
+        Ok(None) => {
+            println!("Already on the latest version.");
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(AppError::Config(format!("upgrade failed: {error}")));
+        }
+    }
+
+    if was_running {
+        println!("Restarting the background daemon...");
+        stop()?;
+        start(&ServeArgs {
+            stt_provider: provider,
+            stt_api_key: None,
+        })?;
     }
     Ok(())
 }

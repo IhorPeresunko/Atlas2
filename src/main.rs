@@ -28,6 +28,7 @@ async fn main() -> AppResult<()> {
             println!("Saved {key}.");
             Ok(())
         }
+        Command::Upgrade => daemon::upgrade().await,
         Command::Run(args) => run_server(&args).await,
     }
 }

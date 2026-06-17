@@ -6,6 +6,7 @@ use std::{
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use directories::ProjectDirs;
 
 use crate::error::{AppError, AppResult};
 
@@ -33,6 +34,8 @@ pub enum Command {
         /// Value to store
         value: String,
     },
+    /// Download and install the latest release, restarting the daemon if running
+    Upgrade,
 }
 
 #[derive(Debug, Clone, Default, Args)]
@@ -85,8 +88,13 @@ impl Config {
         let telegram_bot_token = load_telegram_bot_token()?;
         let telegram_api_base = env::var("ATLAS2_TELEGRAM_API_BASE")
             .unwrap_or_else(|_| "https://api.telegram.org".to_string());
-        let database_path =
-            env::var("ATLAS2_DATABASE_PATH").unwrap_or_else(|_| "./data/atlas2.sqlite".to_string());
+        let database_path = match env::var("ATLAS2_DATABASE_PATH") {
+            Ok(path) => path,
+            Err(_) => data_dir()?
+                .join("atlas2.sqlite")
+                .to_string_lossy()
+                .into_owned(),
+        };
         let codex_bin = env::var("ATLAS2_CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
         let poll_timeout_seconds = env_u64("ATLAS2_POLL_TIMEOUT_SECONDS", 30)?;
         let max_directory_entries = env_usize("ATLAS2_MAX_DIRECTORY_ENTRIES", 20)?;
@@ -146,15 +154,17 @@ pub fn stored_telegram_bot_token() -> AppResult<Option<String>> {
         }
     }
 
-    let token_path = credential_path("ATLAS2_TELEGRAM_BOT_TOKEN_FILE", "telegram_bot_token")?;
-    read_secret_from_file(&token_path, "Telegram bot token")
+    read_credential(
+        "ATLAS2_TELEGRAM_BOT_TOKEN_FILE",
+        "telegram_bot_token",
+        "Telegram bot token",
+    )
 }
 
 /// Reads the persisted ElevenLabs API key without prompting, mirroring
 /// [`stored_telegram_bot_token`].
 pub fn stored_stt_api_key() -> AppResult<Option<String>> {
-    let key_path = credential_path("ATLAS2_STT_API_KEY_FILE", "stt_api_key")?;
-    read_secret_from_file(&key_path, "ElevenLabs API key")
+    read_credential("ATLAS2_STT_API_KEY_FILE", "stt_api_key", "ElevenLabs API key")
 }
 
 /// Persists a configuration secret addressed by a short key, mirroring the
@@ -186,11 +196,13 @@ fn load_stt_api_key(cli_value: Option<String>) -> AppResult<String> {
         return normalize_secret(value, "ElevenLabs API key");
     }
 
-    let key_path = credential_path("ATLAS2_STT_API_KEY_FILE", "stt_api_key")?;
-    if let Some(key) = read_secret_from_file(&key_path, "ElevenLabs API key")? {
+    if let Some(key) =
+        read_credential("ATLAS2_STT_API_KEY_FILE", "stt_api_key", "ElevenLabs API key")?
+    {
         return Ok(key);
     }
 
+    let key_path = credential_path("ATLAS2_STT_API_KEY_FILE", "stt_api_key")?;
     let key = prompt_for_secret("ElevenLabs API key")?;
     persist_secret(&key_path, &key, "ElevenLabs API key")?;
     Ok(key)
@@ -299,6 +311,37 @@ fn persist_secret(path: &Path, secret: &str, label: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn project_dirs() -> AppResult<ProjectDirs> {
+    ProjectDirs::from("", "", "atlas2").ok_or_else(|| {
+        AppError::Config("could not determine a home directory for atlas2 paths".into())
+    })
+}
+
+/// Per-user config directory (`~/.config/atlas2` on Linux). Holds credentials
+/// and the dist install receipt.
+pub fn config_dir() -> AppResult<PathBuf> {
+    Ok(project_dirs()?.config_dir().to_path_buf())
+}
+
+/// Per-user data directory (`~/.local/share/atlas2` on Linux). Holds the
+/// SQLite database.
+pub fn data_dir() -> AppResult<PathBuf> {
+    Ok(project_dirs()?.data_dir().to_path_buf())
+}
+
+/// Per-user state directory (`~/.local/state/atlas2` on Linux). Holds the log
+/// and PID files. Falls back to the data directory on platforms without a
+/// distinct state dir.
+pub fn state_dir() -> AppResult<PathBuf> {
+    let dirs = project_dirs()?;
+    Ok(dirs
+        .state_dir()
+        .unwrap_or_else(|| dirs.data_dir())
+        .to_path_buf())
+}
+
+/// Canonical path for a credential, honoring an explicit env override and
+/// otherwise living in the config directory.
 fn credential_path(env_key: &str, default_name: &str) -> AppResult<PathBuf> {
     if let Ok(value) = env::var(env_key) {
         let path = PathBuf::from(value);
@@ -307,24 +350,30 @@ fn credential_path(env_key: &str, default_name: &str) -> AppResult<PathBuf> {
         }
     }
 
+    config_dir().map(|path| path.join(default_name))
+}
+
+/// Pre-0.1.1 credential location, under the state directory. Read as a fallback
+/// so tokens persisted by older versions keep working after the move to the
+/// config directory.
+fn legacy_credential_path(default_name: &str) -> AppResult<PathBuf> {
     state_dir().map(|path| path.join(default_name))
 }
 
-pub fn state_dir() -> AppResult<PathBuf> {
-    if let Ok(state_home) = env::var("XDG_STATE_HOME") {
-        let path = PathBuf::from(state_home);
-        if !path.as_os_str().is_empty() {
-            return Ok(path.join("atlas2"));
+/// Reads a credential from its canonical location, falling back to the legacy
+/// state-directory location when the env override is not set.
+fn read_credential(env_key: &str, default_name: &str, label: &str) -> AppResult<Option<String>> {
+    let path = credential_path(env_key, default_name)?;
+    if let Some(secret) = read_secret_from_file(&path, label)? {
+        return Ok(Some(secret));
+    }
+    if env::var(env_key).is_err() {
+        let legacy = legacy_credential_path(default_name)?;
+        if legacy != path {
+            return read_secret_from_file(&legacy, label);
         }
     }
-
-    let home = env::var("HOME").map_err(|_| {
-        AppError::Config("HOME is not set; cannot determine token storage path".into())
-    })?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("state")
-        .join("atlas2"))
+    Ok(None)
 }
 
 fn env_u64(key: &str, default: u64) -> AppResult<u64> {

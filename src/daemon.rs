@@ -17,6 +17,29 @@ fn pid_file() -> AppResult<PathBuf> {
     Ok(config::state_dir()?.join(PID_FILE_NAME))
 }
 
+/// Resolves the path to the running executable, tolerating the case where the
+/// binary was replaced in place (e.g. by `upgrade`). After such a replacement
+/// Linux reports `current_exe()` as the now-unlinked inode with a trailing
+/// `" (deleted)"`; the real path then holds the freshly installed binary.
+fn resolve_self_exe() -> AppResult<PathBuf> {
+    let exe = std::env::current_exe()
+        .map_err(|error| AppError::Config(format!("failed to resolve executable path: {error}")))?;
+    if exe.exists() {
+        return Ok(exe);
+    }
+    let raw = exe.to_string_lossy();
+    if let Some(stripped) = raw.strip_suffix(" (deleted)") {
+        let path = PathBuf::from(stripped);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(AppError::Config(format!(
+        "could not locate the atlas2 executable (resolved to {})",
+        exe.display()
+    )))
+}
+
 fn provider_file() -> AppResult<PathBuf> {
     Ok(config::state_dir()?.join(PROVIDER_FILE_NAME))
 }
@@ -108,8 +131,7 @@ pub fn start(args: &ServeArgs) -> AppResult<()> {
         ));
     }
 
-    let exe = std::env::current_exe()
-        .map_err(|error| AppError::Config(format!("failed to resolve executable path: {error}")))?;
+    let exe = resolve_self_exe()?;
 
     let log_path = log_file()?;
     if let Some(parent) = log_path.parent() {

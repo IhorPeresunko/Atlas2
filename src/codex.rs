@@ -1343,6 +1343,9 @@ fn extract_turn_id(value: &Value) -> Option<String> {
 fn is_stale_thread_error_message(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("invalid_encrypted_content")
+        // A thread id whose rollout was never persisted (e.g. a prior turn
+        // failed before completing). Resuming it is hopeless; start fresh.
+        || message.contains("no rollout found")
         || (message.contains("encrypted content")
             && message.contains("could not")
             && (message.contains("decrypted")
@@ -1508,6 +1511,16 @@ mod tests {
         assert!(is_stale_thread_error_message(
             "The encrypted content gAAA... could not be verified. Reason: Encrypted content could not be decrypted or parsed."
         ));
+    }
+
+    #[test]
+    fn restarts_thread_when_rollout_is_missing() {
+        // A thread id was persisted but its rollout never was (e.g. the first
+        // turn failed before completing); resuming it must start fresh.
+        let error = AppError::Codex(
+            "no rollout found for thread id 019ed606-6a50-7f41-974d-54a98d9580aa".into(),
+        );
+        assert!(should_restart_thread_from_resume_error(&error));
     }
 
     #[test]

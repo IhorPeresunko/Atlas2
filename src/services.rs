@@ -291,8 +291,16 @@ impl AppServices {
         self.storage
             .set_active_session(chat_id, Some(&session.session_id))
             .await?;
+        let model_note = match self.ensure_chat_model(chat_id, &workspace.0).await {
+            Ok(Some(model)) => format!("\nModel: {model}."),
+            Ok(None) => String::new(),
+            Err(error) => {
+                tracing::warn!(chat_id = chat_id.0, error = %error, "could not resolve default model for new session");
+                String::new()
+            }
+        };
         Ok(format!(
-            "Started new session in `{}`.\nSend a prompt to start working.",
+            "Started new session in `{}`.{model_note}\nSend a prompt to start working.",
             workspace.0
         ))
     }
@@ -478,6 +486,43 @@ impl AppServices {
         Ok(format!(
             "Model set to {model}. Use /model to also pick a thinking level. It applies to the next turn."
         ))
+    }
+
+    /// Returns Codex's default model for a workspace (the entry it flags as
+    /// default, otherwise the first one), or None if Codex reports no models.
+    async fn resolve_default_model(&self, workspace: &str) -> AppResult<Option<String>> {
+        let models = self.codex.list_models(workspace).await?;
+        Ok(models
+            .iter()
+            .find(|entry| entry.is_default)
+            .or_else(|| models.first())
+            .map(|entry| entry.model.clone()))
+    }
+
+    /// Ensures the chat has a model selected, defaulting to Codex's default for
+    /// the workspace when none is set. The Codex app-server requires a model on
+    /// every turn, so a chat must never reach a turn without one. Returns the
+    /// effective model name when known.
+    async fn ensure_chat_model(
+        &self,
+        chat_id: TelegramChatId,
+        workspace: &str,
+    ) -> AppResult<Option<String>> {
+        if let Some(model) = self
+            .storage
+            .get_chat(chat_id)
+            .await?
+            .and_then(|chat| chat.model)
+        {
+            return Ok(Some(model));
+        }
+        let Some(default_model) = self.resolve_default_model(workspace).await? else {
+            return Ok(None);
+        };
+        self.storage
+            .set_chat_model(chat_id, Some(&default_model))
+            .await?;
+        Ok(Some(default_model))
     }
 
     async fn resolve_folder_entry(
@@ -889,10 +934,17 @@ impl AppServices {
         mode: PromptMode,
     ) -> AppResult<()> {
         let chat_binding = self.storage.get_chat(chat_id).await?;
-        let (model, reasoning_effort) = chat_binding
+        let (mut model, reasoning_effort) = chat_binding
             .map(|chat| (chat.model, chat.reasoning_effort))
             .unwrap_or((None, None));
         let session = self.require_active_session(chat_id).await?;
+        // The Codex app-server rejects a turn without a model. Resolve and
+        // persist its default when the chat has none (e.g. a brand-new chat).
+        if model.is_none() {
+            model = self
+                .ensure_chat_model(chat_id, &session.workspace_path.0)
+                .await?;
+        }
         tracing::info!(
             chat_id = chat_id.0,
             session_id = %session.session_id.0,

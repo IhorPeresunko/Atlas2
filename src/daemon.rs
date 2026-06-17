@@ -24,20 +24,24 @@ fn pid_file() -> AppResult<PathBuf> {
 fn resolve_self_exe() -> AppResult<PathBuf> {
     let exe = std::env::current_exe()
         .map_err(|error| AppError::Config(format!("failed to resolve executable path: {error}")))?;
-    if exe.exists() {
-        return Ok(exe);
+    clean_exe_path(&exe, |path| path.exists()).ok_or_else(|| {
+        AppError::Config(format!(
+            "could not locate the atlas2 executable (resolved to {})",
+            exe.display()
+        ))
+    })
+}
+
+/// Returns the first of `exe` / `exe` with a trailing `" (deleted)"` stripped
+/// that satisfies `exists`. Pure helper so the deleted-inode handling can be
+/// unit tested without replacing the running binary.
+fn clean_exe_path(exe: &std::path::Path, exists: impl Fn(&std::path::Path) -> bool) -> Option<PathBuf> {
+    if exists(exe) {
+        return Some(exe.to_path_buf());
     }
     let raw = exe.to_string_lossy();
-    if let Some(stripped) = raw.strip_suffix(" (deleted)") {
-        let path = PathBuf::from(stripped);
-        if path.exists() {
-            return Ok(path);
-        }
-    }
-    Err(AppError::Config(format!(
-        "could not locate the atlas2 executable (resolved to {})",
-        exe.display()
-    )))
+    let stripped = PathBuf::from(raw.strip_suffix(" (deleted)")?);
+    exists(&stripped).then_some(stripped)
 }
 
 fn provider_file() -> AppResult<PathBuf> {
@@ -255,10 +259,45 @@ pub async fn upgrade() -> AppResult<()> {
     if was_running {
         println!("Restarting the background daemon...");
         stop()?;
-        start(&ServeArgs {
+        if let Err(error) = start(&ServeArgs {
             stt_provider: provider,
             stt_api_key: None,
-        })?;
+        }) {
+            return Err(AppError::Config(format!(
+                "upgrade installed the new version but restarting the daemon failed ({error}); run `atlas2 start` to bring it back up"
+            )));
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::clean_exe_path;
+
+    #[test]
+    fn clean_exe_path_returns_existing_path_unchanged() {
+        let result = clean_exe_path(Path::new("/usr/bin/atlas2"), |p| {
+            p == Path::new("/usr/bin/atlas2")
+        });
+        assert_eq!(result, Some(PathBuf::from("/usr/bin/atlas2")));
+    }
+
+    #[test]
+    fn clean_exe_path_strips_deleted_suffix_after_in_place_upgrade() {
+        // current_exe() points at the unlinked old inode; the real path holds
+        // the freshly installed binary.
+        let result = clean_exe_path(Path::new("/usr/bin/atlas2 (deleted)"), |p| {
+            p == Path::new("/usr/bin/atlas2")
+        });
+        assert_eq!(result, Some(PathBuf::from("/usr/bin/atlas2")));
+    }
+
+    #[test]
+    fn clean_exe_path_returns_none_when_nothing_exists() {
+        let result = clean_exe_path(Path::new("/usr/bin/atlas2 (deleted)"), |_| false);
+        assert_eq!(result, None);
+    }
 }

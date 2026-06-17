@@ -24,8 +24,6 @@ use crate::{
     error::{AppError, AppResult},
 };
 
-const CODEX_DEFAULT_MODEL: &str = "gpt-5.3-codex";
-const CODEX_DEFAULT_REASONING_EFFORT: &str = "medium";
 const STALE_THREAD_RECOVERY_MESSAGE: &str = "Stored Codex conversation could not be resumed; Atlas2 started a fresh thread without prior conversation context.";
 const CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS: &str = concat!(
     "<collaboration_mode># Plan Mode\n\n",
@@ -70,6 +68,8 @@ impl CodexClient {
         session: &SessionRecord,
         prompt: &str,
         mode: PromptMode,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
         mut on_event: F,
     ) -> AppResult<CodexTurnResult>
     where
@@ -84,6 +84,8 @@ impl CodexClient {
                 &self.additional_dirs,
                 session.session_id.clone(),
                 &session.workspace_path.0,
+                model.map(str::to_string),
+                reasoning_effort.map(str::to_string),
             )
             .await?;
             self.runtimes
@@ -212,6 +214,94 @@ impl CodexClient {
                 }
             }
         }
+    }
+
+    /// Ask Codex core which models are available, forwarding its own catalog
+    /// rather than maintaining a hardcoded list. Spins up a short-lived
+    /// app-server purely to issue the `model/list` request.
+    pub async fn list_models(&self, workspace_path: &str) -> AppResult<Vec<ModelOption>> {
+        let mut runtime = AppServerRuntime::start(
+            &self.codex_bin,
+            &self.additional_dirs,
+            SessionId::new(),
+            workspace_path,
+            None,
+            None,
+        )
+        .await?;
+
+        let result = async {
+            runtime.initialize().await?;
+
+            let mut models = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let mut params = json!({ "includeHidden": false });
+                if let Some(cursor) = cursor.as_deref() {
+                    params["cursor"] = json!(cursor);
+                }
+                let response = runtime.send_request("model/list", params).await?;
+                if let Some(data) = response.get("data").and_then(Value::as_array) {
+                    for entry in data {
+                        let Some(model) = entry
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .or_else(|| entry.get("id").and_then(Value::as_str))
+                        else {
+                            continue;
+                        };
+                        let display_name = entry
+                            .get("displayName")
+                            .and_then(Value::as_str)
+                            .unwrap_or(model)
+                            .to_string();
+                        let supported_reasoning_efforts = entry
+                            .get("supportedReasoningEfforts")
+                            .and_then(Value::as_array)
+                            .map(|efforts| {
+                                efforts
+                                    .iter()
+                                    .filter_map(|effort| {
+                                        let slug =
+                                            effort.get("reasoningEffort").and_then(Value::as_str)?;
+                                        Some(ReasoningEffortOption {
+                                            effort: slug.to_string(),
+                                            description: effort
+                                                .get("description")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or_default()
+                                                .to_string(),
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        models.push(ModelOption {
+                            model: model.to_string(),
+                            display_name,
+                            is_default: entry
+                                .get("isDefault")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                            default_reasoning_effort: entry
+                                .get("defaultReasoningEffort")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            supported_reasoning_efforts,
+                        });
+                    }
+                }
+                match response.get("nextCursor").and_then(Value::as_str) {
+                    Some(next) if !next.is_empty() => cursor = Some(next.to_string()),
+                    _ => break,
+                }
+            }
+            Ok::<_, AppError>(models)
+        }
+        .await;
+
+        let _ = runtime.shutdown().await;
+        result
     }
 
     pub async fn resolve_approval(
@@ -350,6 +440,32 @@ struct AppServerRuntime {
     stdout_task: tokio::task::JoinHandle<()>,
     stderr_task: tokio::task::JoinHandle<()>,
     workspace_path: String,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+/// A model entry as reported by Codex core via the `model/list` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelOption {
+    /// Slug forwarded back to Codex (e.g. `gpt-5.5`).
+    pub model: String,
+    /// Human-friendly label for the Telegram picker.
+    pub display_name: String,
+    /// Whether Codex considers this its default model.
+    pub is_default: bool,
+    /// Reasoning effort Codex applies for this model when none is chosen.
+    pub default_reasoning_effort: Option<String>,
+    /// Reasoning efforts this model accepts, in the order Codex advertises them.
+    pub supported_reasoning_efforts: Vec<ReasoningEffortOption>,
+}
+
+/// A reasoning effort level advertised by a model (e.g. `low`, `high`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReasoningEffortOption {
+    /// Slug forwarded back to Codex (e.g. `high`).
+    pub effort: String,
+    /// Human-friendly description for the Telegram picker.
+    pub description: String,
 }
 
 impl AppServerRuntime {
@@ -358,6 +474,8 @@ impl AppServerRuntime {
         _additional_dirs: &[PathBuf],
         session_id: SessionId,
         workspace_path: &str,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
     ) -> AppResult<Self> {
         let mut command = Command::new(codex_bin);
         command
@@ -440,6 +558,8 @@ impl AppServerRuntime {
             stdout_task,
             stderr_task,
             workspace_path: workspace_path.to_string(),
+            model,
+            reasoning_effort,
         })
     }
 
@@ -541,8 +661,16 @@ impl AppServerRuntime {
             params["approvalPolicy"] = json!("on-request");
             params["sandboxPolicy"] = sandbox_policy;
         }
-        params["collaborationMode"] = build_collaboration_mode(mode);
-        params["model"] = json!(CODEX_DEFAULT_MODEL);
+        params["collaborationMode"] = build_collaboration_mode(
+            mode,
+            self.model.as_deref(),
+            self.reasoning_effort.as_deref(),
+        );
+        // Only override the model when a selection has been made; otherwise let
+        // Codex core fall back to its own configured default (~/.codex/config.toml).
+        if let Some(model) = self.model.as_deref() {
+            params["model"] = json!(model);
+        }
 
         self.send_request("turn/start", params).await?;
         Ok(())
@@ -1259,18 +1387,29 @@ fn merge_objects(base: Value, overlay: Value) -> Value {
     Value::Object(merged)
 }
 
-fn build_collaboration_mode(mode: PromptMode) -> Value {
+fn build_collaboration_mode(
+    mode: PromptMode,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+) -> Value {
     let (mode_name, developer_instructions) = match mode {
         PromptMode::Normal => ("default", CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS),
         PromptMode::Plan => ("plan", CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS),
     };
+    let mut settings = json!({
+        "developer_instructions": developer_instructions,
+    });
+    // Forward the chosen model/effort to core; omit when unset so core uses its
+    // own defaults.
+    if let Some(model) = model {
+        settings["model"] = json!(model);
+    }
+    if let Some(reasoning_effort) = reasoning_effort {
+        settings["reasoning_effort"] = json!(reasoning_effort);
+    }
     json!({
         "mode": mode_name,
-        "settings": {
-            "model": CODEX_DEFAULT_MODEL,
-            "reasoning_effort": CODEX_DEFAULT_REASONING_EFFORT,
-            "developer_instructions": developer_instructions,
-        }
+        "settings": settings,
     })
 }
 
@@ -1318,7 +1457,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use super::{
-        CODEX_DEFAULT_MODEL, CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS, CodexEvent,
+        CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS, CodexEvent,
         ToolRequestUserInputParams, build_collaboration_mode, build_resume_cursor_json,
         extract_proposed_plan_markdown, extract_thread_id, extract_turn_id,
         is_stale_thread_error_message, map_item_completed, map_notification,
@@ -1515,16 +1654,26 @@ mod tests {
 
     #[test]
     fn builds_plan_collaboration_mode_with_plan_instructions() {
-        let collaboration = build_collaboration_mode(PromptMode::Plan);
+        let collaboration =
+            build_collaboration_mode(PromptMode::Plan, Some("gpt-5.5"), Some("high"));
 
         assert_eq!(collaboration["mode"], "plan");
-        assert_eq!(collaboration["settings"]["model"], CODEX_DEFAULT_MODEL);
+        assert_eq!(collaboration["settings"]["model"], "gpt-5.5");
+        assert_eq!(collaboration["settings"]["reasoning_effort"], "high");
         assert!(
             collaboration["settings"]["developer_instructions"]
                 .as_str()
                 .unwrap_or_default()
                 .contains("request_user_input")
         );
+    }
+
+    #[test]
+    fn collaboration_mode_omits_model_when_unset() {
+        let collaboration = build_collaboration_mode(PromptMode::Normal, None, None);
+
+        assert!(collaboration["settings"].get("model").is_none());
+        assert!(collaboration["settings"].get("reasoning_effort").is_none());
     }
 
     #[test]

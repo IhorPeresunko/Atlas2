@@ -34,7 +34,9 @@ impl Storage {
                 chat_id INTEGER PRIMARY KEY,
                 chat_kind TEXT NOT NULL,
                 title TEXT,
-                active_session_id TEXT
+                active_session_id TEXT,
+                model TEXT,
+                reasoning_effort TEXT
             );
 
             CREATE TABLE IF NOT EXISTS sessions (
@@ -99,6 +101,8 @@ impl Storage {
         self.ensure_session_column("resume_cursor_json", "TEXT")
             .await?;
         self.ensure_session_column("last_error", "TEXT").await?;
+        self.ensure_chat_column("model", "TEXT").await?;
+        self.ensure_chat_column("reasoning_effort", "TEXT").await?;
         sqlx::query(
             r#"
             UPDATE sessions
@@ -131,6 +135,23 @@ impl Storage {
         Ok(())
     }
 
+    async fn ensure_chat_column(&self, name: &str, definition: &str) -> AppResult<()> {
+        let rows = sqlx::query("PRAGMA table_info(chats)")
+            .fetch_all(&self.pool)
+            .await?;
+        let exists = rows
+            .into_iter()
+            .any(|row| row.get::<String, _>("name") == name);
+        if exists {
+            return Ok(());
+        }
+
+        sqlx::query(&format!("ALTER TABLE chats ADD COLUMN {name} {definition}"))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn upsert_chat(
         &self,
         chat_id: TelegramChatId,
@@ -158,7 +179,7 @@ impl Storage {
     pub async fn get_chat(&self, chat_id: TelegramChatId) -> AppResult<Option<ChatBinding>> {
         let row = sqlx::query(
             r#"
-            SELECT chat_id, active_session_id, chat_kind, title
+            SELECT chat_id, active_session_id, chat_kind, title, model, reasoning_effort
             FROM chats
             WHERE chat_id = ?1
             "#,
@@ -184,6 +205,54 @@ impl Storage {
         )
         .bind(chat_id.0)
         .bind(session_id.map(|id| id.0.to_string()))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Persist the per-chat Codex model preference. Upserts the chat row so the
+    /// preference can be set before any session exists. `None` clears it, so
+    /// turns fall back to Codex core's own default. Always resets the reasoning
+    /// effort, since it is model-specific and a new model invalidates it.
+    pub async fn set_chat_model(
+        &self,
+        chat_id: TelegramChatId,
+        model: Option<&str>,
+    ) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO chats (chat_id, chat_kind, model, reasoning_effort)
+            VALUES (?1, 'unknown', ?2, NULL)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                model = excluded.model,
+                reasoning_effort = NULL
+            "#,
+        )
+        .bind(chat_id.0)
+        .bind(model)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Persist the per-chat reasoning effort preference. `None` clears it, so
+    /// turns fall back to the model's default effort in Codex core.
+    pub async fn set_chat_reasoning_effort(
+        &self,
+        chat_id: TelegramChatId,
+        reasoning_effort: Option<&str>,
+    ) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO chats (chat_id, chat_kind, reasoning_effort)
+            VALUES (?1, 'unknown', ?2)
+            ON CONFLICT(chat_id) DO UPDATE SET reasoning_effort = excluded.reasoning_effort
+            "#,
+        )
+        .bind(chat_id.0)
+        .bind(reasoning_effort)
         .execute(&self.pool)
         .await?;
 
@@ -733,6 +802,8 @@ fn map_chat_binding(row: sqlx::sqlite::SqliteRow) -> AppResult<ChatBinding> {
         active_session_id,
         chat_kind: row.get::<String, _>("chat_kind"),
         title: row.get::<Option<String>, _>("title"),
+        model: row.get::<Option<String>, _>("model"),
+        reasoning_effort: row.get::<Option<String>, _>("reasoning_effort"),
     })
 }
 
@@ -885,6 +956,8 @@ mod tests {
                 active_session_id: Some(session.session_id.clone()),
                 chat_kind: "supergroup".into(),
                 title: Some("Atlas".into()),
+                model: None,
+                reasoning_effort: None,
             })
         );
         assert_eq!(active.workspace_path.0, "/tmp/project");

@@ -89,6 +89,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "libc",
  "regex",
  "reqwest",
  "serde",

@@ -334,6 +334,152 @@ impl AppServices {
         Ok(InlineKeyboardMarkup::single_column(buttons))
     }
 
+    /// Resolve the workspace whose Codex catalog should back the model picker:
+    /// the active session's directory, or the current directory when none.
+    async fn chat_workspace(&self, chat_id: TelegramChatId) -> AppResult<String> {
+        Ok(self
+            .storage
+            .get_active_session_for_chat(chat_id)
+            .await?
+            .map(|session| session.workspace_path.0)
+            .unwrap_or_else(|| ".".to_string()))
+    }
+
+    /// Build the `/model` picker (step 1): the current selection plus the model
+    /// catalog reported by Codex core, rendered as tap-to-select buttons.
+    pub async fn model_menu(
+        &self,
+        chat_id: TelegramChatId,
+    ) -> AppResult<(String, Option<InlineKeyboardMarkup>)> {
+        let chat = self.storage.get_chat(chat_id).await?;
+        let current = chat.as_ref().and_then(|chat| chat.model.clone());
+        let current_effort = chat.as_ref().and_then(|chat| chat.reasoning_effort.clone());
+
+        let workspace = self.chat_workspace(chat_id).await?;
+        let models = self.codex.list_models(&workspace).await?;
+
+        let model_label = current.as_deref().unwrap_or("Codex default");
+        let effort_label = current_effort.as_deref().unwrap_or("model default");
+        let mut text = format!("Current model: {model_label}\nThinking level: {effort_label}\n");
+        if models.is_empty() {
+            text.push_str("\nCodex reported no models. Set one with /model <name>.");
+            return Ok((text, None));
+        }
+        text.push_str("\nPick a model:");
+
+        let mut buttons = Vec::new();
+        for model in &models {
+            let selected = current.as_deref() == Some(model.model.as_str());
+            let mut label = model.display_name.clone();
+            if model.is_default {
+                label.push_str(" (default)");
+            }
+            if selected {
+                label = format!("✓ {label}");
+            }
+            buttons.push(button(label, format!("model-set:{}", model.model)));
+        }
+        Ok((text, Some(InlineKeyboardMarkup::single_column(buttons))))
+    }
+
+    /// Persist a model picked from the step-1 buttons, then either advance to
+    /// the reasoning-level step (step 2) when the model supports it, or finalize.
+    pub async fn select_chat_model(
+        &self,
+        chat_id: TelegramChatId,
+        model: &str,
+    ) -> AppResult<ModelCallbackResult> {
+        // Persisting the model also clears any prior effort (it is model-specific).
+        self.storage.set_chat_model(chat_id, Some(model)).await?;
+
+        let workspace = self.chat_workspace(chat_id).await?;
+        let chosen = self
+            .codex
+            .list_models(&workspace)
+            .await?
+            .into_iter()
+            .find(|entry| entry.model == model);
+
+        let Some(chosen) = chosen else {
+            // Model not in the catalog (e.g. stale list); keep it as-is.
+            return Ok(ModelCallbackResult::Replace(format!(
+                "Model set to {model}. It applies to the next turn."
+            )));
+        };
+
+        if chosen.supported_reasoning_efforts.is_empty() {
+            return Ok(ModelCallbackResult::Replace(format!(
+                "Model set to {model}. It applies to the next turn."
+            )));
+        }
+
+        // Seed the model's default effort so a sensible value is stored even if
+        // the user dismisses step 2 without choosing.
+        if let Some(default_effort) = chosen.default_reasoning_effort.as_deref() {
+            self.storage
+                .set_chat_reasoning_effort(chat_id, Some(default_effort))
+                .await?;
+        }
+
+        let text = format!(
+            "Model set to {model}.\nNow pick a thinking level:"
+        );
+        let mut buttons = Vec::new();
+        for effort in &chosen.supported_reasoning_efforts {
+            let is_default = chosen.default_reasoning_effort.as_deref() == Some(effort.effort.as_str());
+            let mut label = if effort.description.is_empty() {
+                effort.effort.clone()
+            } else {
+                format!("{} — {}", effort.effort, effort.description)
+            };
+            if is_default {
+                label.push_str(" (default)");
+            }
+            buttons.push(button(label, format!("model-effort:{}", effort.effort)));
+        }
+        Ok(ModelCallbackResult::Render(
+            text,
+            InlineKeyboardMarkup::single_column(buttons),
+        ))
+    }
+
+    /// Persist a reasoning level picked from the step-2 buttons and finalize.
+    pub async fn select_chat_reasoning_effort(
+        &self,
+        chat_id: TelegramChatId,
+        effort: &str,
+    ) -> AppResult<String> {
+        self.storage
+            .set_chat_reasoning_effort(chat_id, Some(effort))
+            .await?;
+        let model = self
+            .storage
+            .get_chat(chat_id)
+            .await?
+            .and_then(|chat| chat.model)
+            .unwrap_or_else(|| "Codex default".to_string());
+        Ok(format!(
+            "Model {model}, thinking level {effort}. It applies to the next turn."
+        ))
+    }
+
+    /// Persist a model set directly via `/model <name>`. The reasoning level is
+    /// left at the model's default (cleared); use /model buttons to tune it.
+    pub async fn set_chat_model_by_name(
+        &self,
+        chat_id: TelegramChatId,
+        model: &str,
+    ) -> AppResult<String> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(AppError::Validation("model name cannot be empty".into()));
+        }
+        self.storage.set_chat_model(chat_id, Some(model)).await?;
+        Ok(format!(
+            "Model set to {model}. Use /model to also pick a thinking level. It applies to the next turn."
+        ))
+    }
+
     async fn resolve_folder_entry(
         &self,
         current_path: &str,
@@ -742,7 +888,10 @@ impl AppServices {
         prompt: &str,
         mode: PromptMode,
     ) -> AppResult<()> {
-        let _chat_binding = self.storage.get_chat(chat_id).await?;
+        let chat_binding = self.storage.get_chat(chat_id).await?;
+        let (model, reasoning_effort) = chat_binding
+            .map(|chat| (chat.model, chat.reasoning_effort))
+            .unwrap_or((None, None));
         let session = self.require_active_session(chat_id).await?;
         tracing::info!(
             chat_id = chat_id.0,
@@ -796,7 +945,13 @@ impl AppServices {
 
         let result = self
             .codex
-            .run_turn(&session, prompt, mode, move |event| {
+            .run_turn(
+                &session,
+                prompt,
+                mode,
+                model.as_deref(),
+                reasoning_effort.as_deref(),
+                move |event| {
                 match event {
                     CodexEvent::ThreadStarted {
                         thread_id,
@@ -1168,6 +1323,13 @@ impl AppServices {
 
 pub enum FolderCallbackResult {
     Render(String, InlineKeyboardMarkup),
+    Replace(String),
+}
+
+pub enum ModelCallbackResult {
+    /// Advance to the reasoning-level step (step 2) with new buttons.
+    Render(String, InlineKeyboardMarkup),
+    /// Finalize the selection, replacing the message with a confirmation.
     Replace(String),
 }
 

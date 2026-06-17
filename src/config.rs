@@ -5,21 +5,47 @@ use std::{
     str::FromStr,
 };
 
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "atlas2")]
+#[command(name = "atlas2", version, about = "Telegram bridge for local Codex sessions")]
 pub struct CliArgs {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum Command {
+    /// Start Atlas2 in the background and return immediately
+    Start(ServeArgs),
+    /// Run Atlas2 in the foreground (blocks the terminal)
+    Run(ServeArgs),
+    /// Stop the background Atlas2 process
+    Stop,
+    /// Show whether Atlas2 is running
+    Status,
+    /// Store a configuration value (keys: bottoken, sttkey)
+    Set {
+        /// Configuration key to set (bottoken, sttkey)
+        key: String,
+        /// Value to store
+        value: String,
+    },
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub struct ServeArgs {
     #[arg(long, value_enum, default_value_t = CliSttProvider::None)]
     pub stt_provider: CliSttProvider,
     #[arg(long)]
     pub stt_api_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum CliSttProvider {
+    #[default]
     #[value(name = "none")]
     None,
     #[value(name = "11labs")]
@@ -55,7 +81,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn load(cli: CliArgs) -> AppResult<Self> {
+    pub fn load(args: &ServeArgs) -> AppResult<Self> {
         let telegram_bot_token = load_telegram_bot_token()?;
         let telegram_api_base = env::var("ATLAS2_TELEGRAM_API_BASE")
             .unwrap_or_else(|_| "https://api.telegram.org".to_string());
@@ -66,10 +92,10 @@ impl Config {
         let max_directory_entries = env_usize("ATLAS2_MAX_DIRECTORY_ENTRIES", 20)?;
         let workspace_additional_writable_dirs =
             env::var("ATLAS2_CODEX_ADD_DIRS").unwrap_or_default();
-        let stt_provider = SttProvider::from(cli.stt_provider);
+        let stt_provider = SttProvider::from(args.stt_provider);
         let stt_api_key = match stt_provider {
             SttProvider::None => None,
-            SttProvider::ElevenLabs => Some(load_stt_api_key(cli.stt_api_key)?),
+            SttProvider::ElevenLabs => Some(load_stt_api_key(args.stt_api_key.clone())?),
         };
 
         let database_url = if database_path.starts_with("sqlite:") {
@@ -99,21 +125,60 @@ impl Config {
 }
 
 fn load_telegram_bot_token() -> AppResult<String> {
+    if let Some(token) = stored_telegram_bot_token()? {
+        return Ok(token);
+    }
+
+    let token_path = credential_path("ATLAS2_TELEGRAM_BOT_TOKEN_FILE", "telegram_bot_token")?;
+    let token = prompt_for_secret("Telegram bot token")?;
+    persist_secret(&token_path, &token, "Telegram bot token")?;
+    Ok(token)
+}
+
+/// Reads the Telegram bot token from the environment or the persisted credential
+/// file without prompting. Used by the daemon launcher to fail fast before
+/// detaching, since a detached process cannot prompt on stdin.
+pub fn stored_telegram_bot_token() -> AppResult<Option<String>> {
     if let Ok(value) = env::var("ATLAS2_TELEGRAM_BOT_TOKEN") {
         let token = value.trim().to_string();
         if !token.is_empty() {
-            return Ok(token);
+            return Ok(Some(token));
         }
     }
 
     let token_path = credential_path("ATLAS2_TELEGRAM_BOT_TOKEN_FILE", "telegram_bot_token")?;
-    if let Some(token) = read_secret_from_file(&token_path, "Telegram bot token")? {
-        return Ok(token);
-    }
+    read_secret_from_file(&token_path, "Telegram bot token")
+}
 
-    let token = prompt_for_secret("Telegram bot token")?;
-    persist_secret(&token_path, &token, "Telegram bot token")?;
-    Ok(token)
+/// Reads the persisted ElevenLabs API key without prompting, mirroring
+/// [`stored_telegram_bot_token`].
+pub fn stored_stt_api_key() -> AppResult<Option<String>> {
+    let key_path = credential_path("ATLAS2_STT_API_KEY_FILE", "stt_api_key")?;
+    read_secret_from_file(&key_path, "ElevenLabs API key")
+}
+
+/// Persists a configuration secret addressed by a short key, mirroring the
+/// credential files the foreground server reads on startup.
+pub fn set_secret(key: &str, value: &str) -> AppResult<()> {
+    let (path, label) = match key {
+        "bottoken" | "token" | "telegram" => (
+            credential_path("ATLAS2_TELEGRAM_BOT_TOKEN_FILE", "telegram_bot_token")?,
+            "Telegram bot token",
+        ),
+        "sttkey" | "stt" => (
+            credential_path("ATLAS2_STT_API_KEY_FILE", "stt_api_key")?,
+            "ElevenLabs API key",
+        ),
+        other => {
+            return Err(AppError::Config(format!(
+                "unknown config key '{other}'; known keys: bottoken, sttkey"
+            )));
+        }
+    };
+
+    let secret = normalize_secret(value.to_string(), label)?;
+    persist_secret(&path, &secret, label)?;
+    Ok(())
 }
 
 fn load_stt_api_key(cli_value: Option<String>) -> AppResult<String> {
@@ -245,7 +310,7 @@ fn credential_path(env_key: &str, default_name: &str) -> AppResult<PathBuf> {
     state_dir().map(|path| path.join(default_name))
 }
 
-fn state_dir() -> AppResult<PathBuf> {
+pub fn state_dir() -> AppResult<PathBuf> {
     if let Ok(state_home) = env::var("XDG_STATE_HOME") {
         let path = PathBuf::from(state_home);
         if !path.as_os_str().is_empty() {
@@ -301,7 +366,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        CliArgs, CliSttProvider, Config, SttProvider, normalize_secret, read_secret_from_file,
+        CliSttProvider, Config, ServeArgs, SttProvider, normalize_secret, read_secret_from_file,
     };
 
     #[test]
@@ -335,7 +400,7 @@ mod tests {
             env::set_var("HOME", temp.path());
         }
 
-        let config = Config::load(CliArgs {
+        let config = Config::load(&ServeArgs {
             stt_provider: CliSttProvider::None,
             stt_api_key: None,
         })
@@ -356,7 +421,7 @@ mod tests {
             env::set_var("HOME", temp.path());
         }
 
-        let config = Config::load(CliArgs {
+        let config = Config::load(&ServeArgs {
             stt_provider: CliSttProvider::ElevenLabs,
             stt_api_key: Some("sk_test".into()),
         })

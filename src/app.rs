@@ -1,12 +1,12 @@
 use crate::{
     codex::CodexClient,
-    config::{CliArgs, Config},
+    config::{Config, ServeArgs},
     domain::{ApprovalId, PlanFollowUpId, TelegramChatId, TelegramUserId, UserInputRequestId},
     error::{AppError, AppResult},
     filesystem::FilesystemService,
     services::{
-        AppServices, FolderCallbackResult, PlanFollowUpCallbackResult, UserInputCallbackResult,
-        UserInputTextResult,
+        AppServices, FolderCallbackResult, ModelCallbackResult, PlanFollowUpCallbackResult,
+        UserInputCallbackResult, UserInputTextResult,
     },
     storage::Storage,
     stt::SttClient,
@@ -19,8 +19,8 @@ pub struct App {
 }
 
 impl App {
-    pub async fn bootstrap(cli: CliArgs) -> AppResult<Self> {
-        let config = Config::load(cli)?;
+    pub async fn bootstrap(args: &ServeArgs) -> AppResult<Self> {
+        let config = Config::load(args)?;
         ensure_database_parent_dir(&config.database_url)?;
         let storage = Storage::connect(&config.database_url).await?;
         storage
@@ -163,7 +163,7 @@ impl App {
                             .telegram
                             .send_message(
                                 chat_id,
-                                "Atlas2 commands:\n/new - reuse a historic project or add a new project folder\n/sessions - list known sessions\n/plan <prompt> - run a read-only planning turn\nAny other text - send a prompt to the active Codex session\nUse the Stop button on a running turn to interrupt it.",
+                                "Atlas2 commands:\n/new - reuse a historic project or add a new project folder\n/sessions - list known sessions\n/plan <prompt> - run a read-only planning turn\n/model - pick the Codex model (or /model <name> to set it directly)\nAny other text - send a prompt to the active Codex session\nUse the Stop button on a running turn to interrupt it.",
                                 None,
                                 None,
                             )
@@ -211,6 +211,42 @@ impl App {
                         self.services
                             .telegram
                             .send_message(chat_id, "Usage: /plan <prompt>", None, None)
+                            .await?;
+                    }
+                    IncomingMessage::ModelMenu => {
+                        let services = self.services.clone();
+                        tokio::spawn(async move {
+                            match services.model_menu(chat_id).await {
+                                Ok((text, markup)) => {
+                                    let _ = services
+                                        .telegram
+                                        .send_message(chat_id, &text, None, markup)
+                                        .await;
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        chat_id = chat_id.0,
+                                        error = %error,
+                                        "model menu failed"
+                                    );
+                                    let _ = services
+                                        .telegram
+                                        .send_message(
+                                            chat_id,
+                                            &format!("Could not list models: {error}"),
+                                            None,
+                                            None,
+                                        )
+                                        .await;
+                                }
+                            }
+                        });
+                    }
+                    IncomingMessage::SetModel(model) => {
+                        let text = self.services.set_chat_model_by_name(chat_id, model).await?;
+                        self.services
+                            .telegram
+                            .send_message(chat_id, &text, None, None)
                             .await?;
                     }
                     IncomingMessage::UnknownCommand => {
@@ -439,6 +475,39 @@ impl App {
                     }
                     PlanFollowUpCallbackResult::Implement { .. } => unreachable!(),
                 }
+            } else if let Some(model) = data.strip_prefix("model-set:") {
+                match self.services.select_chat_model(chat_id, model).await? {
+                    ModelCallbackResult::Render(text, markup) => {
+                        self.services
+                            .telegram
+                            .edit_message_text(
+                                chat_id,
+                                message.message_id,
+                                &text,
+                                None,
+                                Some(markup),
+                            )
+                            .await?;
+                        Ok("Now pick a thinking level.".into())
+                    }
+                    ModelCallbackResult::Replace(text) => {
+                        self.services
+                            .telegram
+                            .edit_message_text(chat_id, message.message_id, &text, None, None)
+                            .await?;
+                        Ok(text)
+                    }
+                }
+            } else if let Some(effort) = data.strip_prefix("model-effort:") {
+                let text = self
+                    .services
+                    .select_chat_reasoning_effort(chat_id, effort)
+                    .await?;
+                self.services
+                    .telegram
+                    .edit_message_text(chat_id, message.message_id, &text, None, None)
+                    .await?;
+                Ok(text)
             } else {
                 match self
                     .services
@@ -499,6 +568,8 @@ fn incoming_message_name(message: &IncomingMessage<'_>) -> &'static str {
         IncomingMessage::Sessions => "sessions",
         IncomingMessage::Plan(_) => "plan",
         IncomingMessage::PlanUsage => "plan_usage",
+        IncomingMessage::ModelMenu => "model_menu",
+        IncomingMessage::SetModel(_) => "set_model",
         IncomingMessage::UnknownCommand => "unknown_command",
         IncomingMessage::Prompt(_) => "prompt",
     }
@@ -522,6 +593,8 @@ enum IncomingMessage<'a> {
     Sessions,
     Plan(&'a str),
     PlanUsage,
+    ModelMenu,
+    SetModel(&'a str),
     UnknownCommand,
     Prompt(&'a str),
 }
@@ -532,6 +605,7 @@ fn parse_message_text(text: &str) -> IncomingMessage<'_> {
         "/new" => IncomingMessage::NewSession,
         "/sessions" => IncomingMessage::Sessions,
         "/plan" => IncomingMessage::PlanUsage,
+        "/model" => IncomingMessage::ModelMenu,
         _ => {
             if let Some(prompt) = text.strip_prefix("/plan ") {
                 let prompt = prompt.trim();
@@ -546,6 +620,13 @@ fn parse_message_text(text: &str) -> IncomingMessage<'_> {
                     IncomingMessage::PlanUsage
                 } else {
                     IncomingMessage::Plan(prompt)
+                }
+            } else if let Some(model) = text.strip_prefix("/model ") {
+                let model = model.trim();
+                if model.is_empty() {
+                    IncomingMessage::ModelMenu
+                } else {
+                    IncomingMessage::SetModel(model)
                 }
             } else if text.starts_with('/') {
                 IncomingMessage::UnknownCommand
@@ -583,6 +664,16 @@ mod tests {
     fn rejects_empty_plan_command() {
         assert_eq!(parse_message_text("/plan"), IncomingMessage::PlanUsage);
         assert_eq!(parse_message_text("/plan   "), IncomingMessage::PlanUsage);
+    }
+
+    #[test]
+    fn parses_model_command_variants() {
+        assert_eq!(parse_message_text("/model"), IncomingMessage::ModelMenu);
+        assert_eq!(parse_message_text("/model   "), IncomingMessage::ModelMenu);
+        assert_eq!(
+            parse_message_text("/model gpt-5.5"),
+            IncomingMessage::SetModel("gpt-5.5")
+        );
     }
 
     #[test]

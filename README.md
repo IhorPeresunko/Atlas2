@@ -74,7 +74,7 @@ Atlas2 follows the XDG base-directory layout (overridable per item via env vars)
 | SQLite database | `~/.local/share/atlas2/atlas2.sqlite` | `ATLAS2_DATABASE_PATH` |
 | Log + PID files | `~/.local/state/atlas2/` | `XDG_STATE_HOME` |
 
-Atlas2 loads the Telegram bot token from `ATLAS2_TELEGRAM_BOT_TOKEN` when set. Otherwise it reuses the persisted token from `~/.config/atlas2/telegram_bot_token` (the file written by `atlas2 set bottoken`; the pre-0.1.1 `~/.local/state/atlas2/` location is still read as a fallback), or prompts once when run in the foreground and saves it for later restarts.
+Atlas2 loads the Telegram bot token from `ATLAS2_TELEGRAM_BOT_TOKEN` when set. Otherwise it reuses the persisted token from `~/.config/atlas2/telegram_bot_token` (the file written by `atlas2 set bottoken`), or prompts once when run in the foreground and saves it for later restarts.
 
 Enable voice-message transcription with ElevenLabs by passing the flag to `start` or `run`:
 

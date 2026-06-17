@@ -353,27 +353,10 @@ fn credential_path(env_key: &str, default_name: &str) -> AppResult<PathBuf> {
     config_dir().map(|path| path.join(default_name))
 }
 
-/// Pre-0.1.1 credential location, under the state directory. Read as a fallback
-/// so tokens persisted by older versions keep working after the move to the
-/// config directory.
-fn legacy_credential_path(default_name: &str) -> AppResult<PathBuf> {
-    state_dir().map(|path| path.join(default_name))
-}
-
-/// Reads a credential from its canonical location, falling back to the legacy
-/// state-directory location when the env override is not set.
+/// Reads a credential from its canonical location.
 fn read_credential(env_key: &str, default_name: &str, label: &str) -> AppResult<Option<String>> {
     let path = credential_path(env_key, default_name)?;
-    if let Some(secret) = read_secret_from_file(&path, label)? {
-        return Ok(Some(secret));
-    }
-    if env::var(env_key).is_err() {
-        let legacy = legacy_credential_path(default_name)?;
-        if legacy != path {
-            return read_secret_from_file(&legacy, label);
-        }
-    }
-    Ok(None)
+    read_secret_from_file(&path, label)
 }
 
 fn env_u64(key: &str, default: u64) -> AppResult<u64> {

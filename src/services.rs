@@ -1,10 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
 use chrono::Utc;
-use regex::Regex;
 use tokio::sync::{
     Mutex, OwnedMutexGuard,
-    mpsc::{UnboundedSender, unbounded_channel},
+    mpsc::unbounded_channel,
 };
 
 use crate::{
@@ -14,16 +13,23 @@ use crate::{
         ApprovalId, ApprovalStatus, FolderBrowseState, HistoricProject, PendingApproval,
         PendingPlanFollowUp, PendingUserInput, PlanFollowUpId, PlanFollowUpStatus, PromptMode,
         SessionBackend, SessionId, SessionRecord, SessionStatus, TelegramChatId, TelegramUserId,
-        UserInputAnswer, UserInputOption, UserInputRequestId, UserInputStatus, WorkspacePath,
+        UserInputAnswer, UserInputRequestId, UserInputStatus, WorkspacePath,
     },
     error::{AppError, AppResult},
     filesystem::FilesystemService,
+    presentation::{
+        TelegramMessage, TelegramTurnDeliveryState, TelegramTurnUpdate, TurnTerminalState,
+        historic_projects_markup, plan_follow_up_markup, render_command_finished_message,
+        render_historic_projects_prompt, render_turn_terminal_text, render_user_input_prompt,
+        render_user_input_summary, render_voice_transcript_message, send_clear_status_update,
+        send_command_finished_update, send_status_update, send_telegram_update, send_text_update,
+        turn_control_markup, user_input_markup,
+    },
     storage::Storage,
     stt::SttClient,
-    telegram::{InlineKeyboardMarkup, ParseMode, TelegramClient, button},
+    telegram::{InlineKeyboardMarkup, TelegramClient, button},
 };
 
-const TELEGRAM_TEXT_LIMIT: usize = 3900;
 const HISTORIC_PROJECT_LIMIT: usize = 8;
 
 #[derive(Debug, Clone)]
@@ -31,14 +37,6 @@ struct LiveTurnControl {
     chat_id: TelegramChatId,
     control_message_id: i64,
     stop_requested: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TurnTerminalState {
-    Completed,
-    Interrupted,
-    Stopped,
-    Failed,
 }
 
 #[derive(Clone)]
@@ -1400,483 +1398,8 @@ pub enum PlanFollowUpCallbackResult {
     Implement { text: String, prompt: String },
 }
 
-fn render_historic_projects_prompt() -> String {
-    "Select a project or add a new one.".into()
-}
-
-fn historic_projects_markup(projects: &[HistoricProject]) -> InlineKeyboardMarkup {
-    let mut buttons = Vec::new();
-    for project in projects {
-        let label = format!("Reuse {}", compact_absolute_path(&project.workspace_path.0));
-        buttons.push(button(
-            label,
-            format!("project-history-select:{}", project.source_session_id.0),
-        ));
-    }
-    buttons.push(button("Add new project", "project-add-new:current"));
-    InlineKeyboardMarkup::single_column(buttons)
-}
-
-fn trim_for_telegram(text: &str) -> String {
-    let trimmed: String = text.chars().take(TELEGRAM_TEXT_LIMIT).collect();
-    if trimmed.is_empty() {
-        "Working...".into()
-    } else {
-        trimmed
-    }
-}
-
-fn user_input_markup(request: &PendingUserInput) -> AppResult<InlineKeyboardMarkup> {
-    let question_index = request.answers.len();
-    let question = request
-        .questions
-        .get(question_index)
-        .ok_or_else(|| AppError::Validation("no pending question remains".into()))?;
-    let options = question
-        .options
-        .as_ref()
-        .ok_or_else(|| AppError::Validation("question has no selectable options".into()))?;
-
-    let buttons = options
-        .iter()
-        .enumerate()
-        .map(|(option_index, option)| {
-            vec![button(
-                &option.label,
-                format!(
-                    "user-input-answer:{}:{}:{}",
-                    request.request_id.0, question_index, option_index
-                ),
-            )]
-        })
-        .collect();
-    Ok(InlineKeyboardMarkup {
-        inline_keyboard: buttons,
-    })
-}
-
-fn render_user_input_prompt(request: &PendingUserInput) -> String {
-    let question_index = request.answers.len();
-    let question = &request.questions[question_index];
-
-    let mut lines = vec![format!(
-        "Codex needs your input ({}/{})",
-        question_index + 1,
-        request.questions.len()
-    )];
-    if !question.header.is_empty() {
-        lines.push(question.header.clone());
-    }
-    lines.push(question.question.clone());
-    lines.push("Reply with a button tap or send a text answer.".into());
-
-    if !request.answers.is_empty() {
-        lines.push(String::new());
-        lines.push("Answered so far:".into());
-        for answered_question in request.questions.iter().take(question_index) {
-            if let Some(answer) = request.answers.get(&answered_question.id) {
-                let value = answer.answers.join(", ");
-                lines.push(format!("- {}: {}", answered_question.header, value));
-            }
-        }
-    }
-
-    if let Some(options) = question.options.as_ref() {
-        lines.push(String::new());
-        lines.push("Options:".into());
-        for UserInputOption { label, description } in options {
-            lines.push(format!("- {}: {}", label, description));
-        }
-    }
-
-    trim_for_telegram(&lines.join("\n"))
-}
-
-fn render_user_input_summary(request: &PendingUserInput) -> String {
-    let mut lines = vec!["Sent your response to Codex.".into()];
-    for question in &request.questions {
-        if let Some(answer) = request.answers.get(&question.id) {
-            lines.push(format!(
-                "- {}: {}",
-                question.header,
-                answer.answers.join(", ")
-            ));
-        }
-    }
-    trim_for_telegram(&lines.join("\n"))
-}
-
-fn plan_follow_up_markup(follow_up: &PendingPlanFollowUp) -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup {
-        inline_keyboard: vec![vec![
-            button(
-                "Implement",
-                format!("plan-implement:{}", follow_up.follow_up_id.0),
-            ),
-            button(
-                "Add details",
-                format!("plan-refine:{}", follow_up.follow_up_id.0),
-            ),
-        ]],
-    }
-}
-
 fn build_plan_implementation_prompt(plan_markdown: &str) -> String {
     format!("PLEASE IMPLEMENT THIS PLAN:\n{}", plan_markdown.trim())
-}
-
-fn turn_control_markup(session_id: &SessionId) -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::single_column(vec![button("Stop", format!("turn-stop:{}", session_id.0))])
-}
-
-fn render_turn_terminal_text(state: TurnTerminalState, detail: Option<&str>) -> String {
-    match state {
-        TurnTerminalState::Completed => "Codex turn completed.".into(),
-        TurnTerminalState::Interrupted => "Codex turn interrupted.".into(),
-        TurnTerminalState::Stopped => "Codex turn stopped.".into(),
-        TurnTerminalState::Failed => match detail {
-            Some(detail) if !detail.is_empty() => {
-                trim_for_telegram(&format!("Codex turn failed.\n{detail}"))
-            }
-            _ => "Codex turn failed.".into(),
-        },
-    }
-}
-
-#[derive(Debug)]
-enum TelegramTurnUpdate {
-    Status(TelegramMessage),
-    Message(TelegramMessage),
-    ClearStatus,
-    Approval {
-        summary: String,
-        markup: InlineKeyboardMarkup,
-    },
-    PlanFollowUp {
-        text: String,
-        markup: InlineKeyboardMarkup,
-    },
-    UserInput {
-        text: String,
-        markup: InlineKeyboardMarkup,
-    },
-}
-
-#[derive(Debug, Clone)]
-struct TelegramMessage {
-    text: String,
-    parse_mode: Option<ParseMode>,
-}
-
-#[derive(Debug, Default)]
-struct TelegramTurnDeliveryState {
-    transient_status_message_id: Option<i64>,
-    transient_status_text: Option<String>,
-}
-
-#[cfg(test)]
-fn build_codex_prompt(prompt: &str, mode: PromptMode) -> String {
-    match mode {
-        PromptMode::Normal => prompt.to_string(),
-        PromptMode::Plan => format!(
-            concat!(
-                "You are in Atlas2 plan mode.\n",
-                "Analyze the request and return a concrete implementation plan only.\n",
-                "Do not modify files, do not apply patches, and do not run write operations.\n",
-                "You may inspect the codebase and run non-mutating commands as needed.\n",
-                "\n",
-                "Plan mode rules:\n",
-                "- Stay in plan mode until a developer message explicitly ends it.\n",
-                "- If the user asks you to implement while still in plan mode, treat it as a request to plan the implementation.\n",
-                "- Ask follow-up questions when they materially change the plan or confirm an important assumption.\n",
-                "- Strongly prefer the request_user_input tool for those follow-up questions whenever the choice can be expressed with meaningful options.\n",
-                "- Prefer exploring the repository before asking questions that can be answered from local context.\n",
-                "\n",
-                "Finalization rules:\n",
-                "- Only present the final plan when it is decision-complete and leaves no important decisions to the implementer.\n",
-                "- When you present the official plan, wrap it in a <proposed_plan> block exactly like this:\n",
-                "<proposed_plan>\n",
-                "# Plan title\n",
-                "...\n",
-                "</proposed_plan>\n",
-                "- The opening and closing tags must each be on their own line.\n",
-                "- Use Markdown inside the block.\n",
-                "- Output at most one <proposed_plan> block per turn.\n",
-                "- Do not ask \"should I proceed?\" after the final plan.\n",
-                "\n",
-                "User request:\n{}"
-            ),
-            prompt
-        ),
-    }
-}
-
-fn render_voice_transcript_message(transcript: &str) -> String {
-    format!(
-        "Transcribed voice message:\n{}",
-        compact_text_for_telegram(transcript)
-    )
-}
-
-fn send_text_update(
-    telegram_updates_tx: &UnboundedSender<TelegramTurnUpdate>,
-    text: impl Into<String>,
-) {
-    send_plain_update(telegram_updates_tx, text);
-}
-
-fn send_status_update(
-    telegram_updates_tx: &UnboundedSender<TelegramTurnUpdate>,
-    text: impl Into<String>,
-) {
-    let compact = compact_text_for_telegram(&text.into());
-    let _ = telegram_updates_tx.send(TelegramTurnUpdate::Status(TelegramMessage {
-        text: trim_for_telegram(&compact),
-        parse_mode: None,
-    }));
-}
-
-fn send_clear_status_update(telegram_updates_tx: &UnboundedSender<TelegramTurnUpdate>) {
-    let _ = telegram_updates_tx.send(TelegramTurnUpdate::ClearStatus);
-}
-
-fn send_plain_update(
-    telegram_updates_tx: &UnboundedSender<TelegramTurnUpdate>,
-    text: impl Into<String>,
-) {
-    let compact = compact_text_for_telegram(&text.into());
-    let _ = telegram_updates_tx.send(TelegramTurnUpdate::Message(TelegramMessage {
-        text: if compact.is_empty() {
-            "Working...".into()
-        } else {
-            compact
-        },
-        parse_mode: None,
-    }));
-}
-
-fn send_command_finished_update(
-    telegram_updates_tx: &UnboundedSender<TelegramTurnUpdate>,
-    message: TelegramMessage,
-) {
-    let _ = telegram_updates_tx.send(TelegramTurnUpdate::Message(message));
-}
-
-async fn send_telegram_update(
-    telegram: &TelegramClient,
-    chat_id: TelegramChatId,
-    delivery_state: &mut TelegramTurnDeliveryState,
-    update: TelegramTurnUpdate,
-) -> AppResult<()> {
-    match update {
-        TelegramTurnUpdate::Status(message) => {
-            upsert_status_message(telegram, chat_id, delivery_state, message).await?;
-        }
-        TelegramTurnUpdate::Message(message) => {
-            clear_status_message(telegram, chat_id, delivery_state).await?;
-            telegram
-                .send_message(chat_id, &message.text, message.parse_mode, None)
-                .await?;
-        }
-        TelegramTurnUpdate::ClearStatus => {
-            clear_status_message(telegram, chat_id, delivery_state).await?;
-        }
-        TelegramTurnUpdate::Approval { summary, markup } => {
-            clear_status_message(telegram, chat_id, delivery_state).await?;
-            telegram
-                .send_message(chat_id, &summary, None, Some(markup))
-                .await?;
-        }
-        TelegramTurnUpdate::PlanFollowUp { text, markup } => {
-            clear_status_message(telegram, chat_id, delivery_state).await?;
-            telegram
-                .send_message(chat_id, &text, None, Some(markup))
-                .await?;
-        }
-        TelegramTurnUpdate::UserInput { text, markup } => {
-            clear_status_message(telegram, chat_id, delivery_state).await?;
-            telegram
-                .send_message(chat_id, &text, None, Some(markup))
-                .await?;
-        }
-    }
-    Ok(())
-}
-
-async fn upsert_status_message(
-    telegram: &TelegramClient,
-    chat_id: TelegramChatId,
-    delivery_state: &mut TelegramTurnDeliveryState,
-    message: TelegramMessage,
-) -> AppResult<()> {
-    if let Some(message_id) = delivery_state.transient_status_message_id {
-        if delivery_state.transient_status_text.as_deref() == Some(message.text.as_str()) {
-            return Ok(());
-        }
-        telegram
-            .edit_message_text(chat_id, message_id, &message.text, message.parse_mode, None)
-            .await?;
-    } else {
-        let sent = telegram
-            .send_message(chat_id, &message.text, message.parse_mode, None)
-            .await?;
-        delivery_state.transient_status_message_id = Some(sent.message_id);
-    }
-
-    delivery_state.transient_status_text = Some(message.text);
-    Ok(())
-}
-
-async fn clear_status_message(
-    telegram: &TelegramClient,
-    chat_id: TelegramChatId,
-    delivery_state: &mut TelegramTurnDeliveryState,
-) -> AppResult<()> {
-    if let Some(message_id) = delivery_state.transient_status_message_id.take() {
-        let _ = telegram.delete_message(chat_id, message_id).await?;
-    }
-    delivery_state.transient_status_text = None;
-    Ok(())
-}
-
-fn render_command_finished_message(command: &str, exit_code: i64, output: &str) -> TelegramMessage {
-    let summary = format!(
-        "<b>Command finished ({exit_code})</b>\n<code>{}</code>\n<blockquote expandable>",
-        escape_html(command)
-    );
-    let suffix = "</blockquote>";
-    let available = TELEGRAM_TEXT_LIMIT.saturating_sub(summary.len() + suffix.len());
-    let escaped_output = escape_html(output);
-    let output_body = if escaped_output.is_empty() {
-        "(no output)".to_string()
-    } else {
-        trim_html_body(&escaped_output, available)
-    };
-
-    TelegramMessage {
-        text: format!("{summary}{output_body}{suffix}"),
-        parse_mode: Some(ParseMode::Html),
-    }
-}
-
-fn trim_html_body(text: &str, max_len: usize) -> String {
-    if max_len == 0 {
-        return String::new();
-    }
-
-    let mut trimmed = String::new();
-    for ch in text.chars() {
-        if trimmed.len() + ch.len_utf8() > max_len {
-            break;
-        }
-        trimmed.push(ch);
-    }
-
-    if trimmed.is_empty() {
-        return trimmed;
-    }
-
-    if trimmed.len() == text.len() {
-        return trimmed;
-    }
-
-    let ellipsis = "...";
-    while trimmed.len() + ellipsis.len() > max_len {
-        if trimmed.pop().is_none() {
-            return String::new();
-        }
-    }
-    trimmed.push_str(ellipsis);
-    trimmed
-}
-
-fn escape_html(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
-}
-
-fn compact_text_for_telegram(text: &str) -> String {
-    let mut compacted = replace_markdown_file_links(text);
-    compacted = shorten_bare_absolute_paths(&compacted);
-    compacted
-}
-
-fn replace_markdown_file_links(text: &str) -> String {
-    let re = Regex::new(r"\[([^\]]+)\]\((/[^)\s]+)\)").expect("valid markdown file link regex");
-    re.replace_all(text, |captures: &regex::Captures<'_>| {
-        compact_path_label(&captures[1])
-    })
-    .into_owned()
-}
-
-fn shorten_bare_absolute_paths(text: &str) -> String {
-    let re = Regex::new(r"(/home/[^\s)\]]+)").expect("valid absolute path regex");
-    re.replace_all(text, |captures: &regex::Captures<'_>| {
-        compact_absolute_path(&captures[1])
-    })
-    .into_owned()
-}
-
-fn compact_path_label(label: &str) -> String {
-    if label.contains('/') {
-        compact_relative_path(label)
-    } else {
-        label.to_string()
-    }
-}
-
-fn compact_relative_path(label: &str) -> String {
-    let (path, suffix) = split_path_suffix(label);
-    let segments: Vec<&str> = path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    if segments.len() <= 3 {
-        return label.to_string();
-    }
-
-    format!(
-        ".../{}/{}{}",
-        segments[segments.len() - 2],
-        segments[segments.len() - 1],
-        suffix
-    )
-}
-
-fn compact_absolute_path(path: &str) -> String {
-    let (path, suffix) = split_path_suffix(path);
-    let segments: Vec<&str> = path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    if segments.len() <= 3 {
-        return format!("{path}{suffix}");
-    }
-
-    format!(
-        ".../{}/{}{}",
-        segments[segments.len() - 2],
-        segments[segments.len() - 1],
-        suffix
-    )
-}
-
-fn split_path_suffix(path: &str) -> (&str, &str) {
-    for marker in ["#L", ":", "?"] {
-        if let Some(index) = path.find(marker) {
-            return (&path[..index], &path[index..]);
-        }
-    }
-    (path, "")
 }
 
 #[cfg(test)]
@@ -1889,15 +1412,16 @@ mod tests {
         UserInputQuestion, UserInputRequestId, UserInputStatus, WorkspacePath,
     };
     use crate::{
+        codex::build_codex_prompt,
         domain::PromptMode,
-        services::{
-            AppServices, TELEGRAM_TEXT_LIMIT, TelegramTurnUpdate, TurnTerminalState,
-            build_codex_prompt, build_plan_implementation_prompt, compact_text_for_telegram,
+        presentation::{
+            TELEGRAM_TEXT_LIMIT, TelegramTurnUpdate, TurnTerminalState, compact_text_for_telegram,
             historic_projects_markup, plan_follow_up_markup, render_command_finished_message,
             render_historic_projects_prompt, render_turn_terminal_text, render_user_input_prompt,
             render_voice_transcript_message, send_clear_status_update, send_status_update,
             send_text_update, trim_for_telegram, turn_control_markup, user_input_markup,
         },
+        services::{AppServices, build_plan_implementation_prompt},
         storage::Storage,
         stt::SttClient,
         telegram::ParseMode,

@@ -5,6 +5,7 @@ mod daemon;
 mod domain;
 mod error;
 mod filesystem;
+mod presentation;
 mod services;
 mod storage;
 mod stt;

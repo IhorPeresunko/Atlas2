@@ -1416,7 +1416,7 @@ fn build_collaboration_mode(
     })
 }
 
-fn build_codex_prompt(prompt: &str, mode: PromptMode) -> String {
+pub(crate) fn build_codex_prompt(prompt: &str, mode: PromptMode) -> String {
     match mode {
         PromptMode::Normal => prompt.to_string(),
         PromptMode::Plan => format!(

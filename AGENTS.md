@@ -123,6 +123,15 @@ Core product behavior:
 
 ---
 
+## Build and Release
+
+- Build/run from a source checkout with `cargo run -- <command>` (e.g. `cargo run -- run` for a foreground server, `cargo run -- status`). `cargo install --path .` installs the local build into `~/.cargo/bin`.
+- Releases are produced by [`dist`](https://opensource.axo.dev/cargo-dist/), configured in `dist-workspace.toml` (Linux x86_64 gnu + static musl, shell installer, GitHub hosting). Regenerate the workflow with `dist generate` after changing that config.
+- To cut a release: bump `version` in `Cargo.toml`, commit, then push a matching tag (`git tag vX.Y.Z && git push origin vX.Y.Z`). The GitHub Actions release workflow builds the binaries and publishes the installer and assets.
+- `atlas2 upgrade` self-updates via the `axoupdater` library using the install receipt the installer writes; it only works for installer-based installs, not `cargo install`. Validating an upgrade-restart change end-to-end requires the fix to be in the *running* version before the upgrade, so it typically takes a follow-up release to confirm.
+
+---
+
 ## Change Checklist
 
 Before handing off a change, verify:

@@ -24,13 +24,12 @@ Each Telegram group has one active Codex session at a time. A group admin runs `
 
 Requirements:
 
-- Rust
-- local `codex` binary installed and logged in
+- Linux x86_64
+- a local `codex` binary installed and logged in
 
 ### Install
 
-On a machine without a Rust toolchain, install a prebuilt binary with the
-one-line installer (available once a release has been published):
+Install the prebuilt binary with the one-line installer:
 
 ```bash
 curl -fsSL https://github.com/IhorPeresunko/Atlas2/releases/latest/download/atlas2-installer.sh | sh
@@ -38,12 +37,7 @@ curl -fsSL https://github.com/IhorPeresunko/Atlas2/releases/latest/download/atla
 
 This downloads the right binary for your platform (Linux x86_64, glibc or
 static musl) and installs `atlas2` into `~/.cargo/bin`, adding it to your
-`PATH`. From a checkout with Rust installed you can instead run
-`cargo install --path .`.
-
-Releases are produced by [`dist`](https://opensource.axo.dev/cargo-dist/): push
-a version tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`) and the GitHub
-Actions release workflow builds the binaries and publishes the installer.
+`PATH`.
 
 ### Usage
 
@@ -60,9 +54,7 @@ atlas2 run                    # run in the foreground (blocks the terminal)
 
 `atlas2 start` spawns a detached background process, writes its PID to `~/.local/state/atlas2/atlas2.pid`, and streams logs to `~/.local/state/atlas2/atlas2.log`. It returns control to your shell right away and the process survives the terminal that launched it. Configure the bot token with `atlas2 set bottoken <token>` first, since a background process cannot prompt for it.
 
-`atlas2 upgrade` downloads the latest GitHub release in place (using the install receipt written by the one-line installer) and restarts the background daemon if it was running. It only works for installs done via the release installer, not `cargo install`.
-
-During development you can run from source with `cargo run -- <command>`, e.g. `cargo run -- run` for a foreground server or `cargo run -- status`.
+`atlas2 upgrade` downloads the latest release in place and restarts the background daemon if it was running.
 
 ### Files
 
@@ -108,4 +100,3 @@ atlas2 run --stt-provider 11labs --stt-api-key sk_...
 - Atlas2 is designed as a local binary, not a Docker-first app.
 - SQLite is the default persistence backend.
 - Approval decisions continue the live app-server turn while Atlas2 is running.
-# atlas2

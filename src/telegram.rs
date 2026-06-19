@@ -236,6 +236,85 @@ impl TelegramClient {
     }
 }
 
+/// Seam over the Telegram Bot API adapter so business logic in `services` (and
+/// the presentation delivery loop) can run against a fake instead of real HTTP.
+#[async_trait::async_trait]
+pub(crate) trait TelegramApi: Clone + Send + Sync {
+    async fn send_message(
+        &self,
+        chat_id: TelegramChatId,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+        reply_markup: Option<InlineKeyboardMarkup>,
+    ) -> AppResult<Message>;
+
+    async fn edit_message_text(
+        &self,
+        chat_id: TelegramChatId,
+        message_id: i64,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+        reply_markup: Option<InlineKeyboardMarkup>,
+    ) -> AppResult<Message>;
+
+    async fn delete_message(&self, chat_id: TelegramChatId, message_id: i64) -> AppResult<bool>;
+
+    async fn get_chat_member(
+        &self,
+        chat_id: TelegramChatId,
+        user_id: TelegramUserId,
+    ) -> AppResult<ChatMember>;
+
+    async fn get_file(&self, file_id: &str) -> AppResult<TelegramFile>;
+
+    async fn download_file_bytes(&self, file_path: &str) -> AppResult<Vec<u8>>;
+}
+
+#[async_trait::async_trait]
+impl TelegramApi for TelegramClient {
+    async fn send_message(
+        &self,
+        chat_id: TelegramChatId,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+        reply_markup: Option<InlineKeyboardMarkup>,
+    ) -> AppResult<Message> {
+        TelegramClient::send_message(self, chat_id, text, parse_mode, reply_markup).await
+    }
+
+    async fn edit_message_text(
+        &self,
+        chat_id: TelegramChatId,
+        message_id: i64,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+        reply_markup: Option<InlineKeyboardMarkup>,
+    ) -> AppResult<Message> {
+        TelegramClient::edit_message_text(self, chat_id, message_id, text, parse_mode, reply_markup)
+            .await
+    }
+
+    async fn delete_message(&self, chat_id: TelegramChatId, message_id: i64) -> AppResult<bool> {
+        TelegramClient::delete_message(self, chat_id, message_id).await
+    }
+
+    async fn get_chat_member(
+        &self,
+        chat_id: TelegramChatId,
+        user_id: TelegramUserId,
+    ) -> AppResult<ChatMember> {
+        TelegramClient::get_chat_member(self, chat_id, user_id).await
+    }
+
+    async fn get_file(&self, file_id: &str) -> AppResult<TelegramFile> {
+        TelegramClient::get_file(self, file_id).await
+    }
+
+    async fn download_file_bytes(&self, file_path: &str) -> AppResult<Vec<u8>> {
+        TelegramClient::download_file_bytes(self, file_path).await
+    }
+}
+
 fn telegram_retry_after_seconds<T>(envelope: &TelegramEnvelope<T>) -> Option<u64> {
     envelope.parameters.as_ref()?.retry_after
 }

@@ -7,7 +7,7 @@ use tokio::sync::{
 };
 
 use crate::{
-    codex::{CodexClient, CodexEvent},
+    codex::{CodexApi, CodexClient, CodexEvent},
     config::Config,
     domain::{
         ApprovalId, ApprovalStatus, FolderBrowseState, HistoricProject, PendingApproval,
@@ -27,7 +27,7 @@ use crate::{
     },
     storage::Storage,
     stt::SttClient,
-    telegram::{InlineKeyboardMarkup, TelegramClient, button},
+    telegram::{InlineKeyboardMarkup, TelegramApi, TelegramClient, button},
 };
 
 const HISTORIC_PROJECT_LIMIT: usize = 8;
@@ -40,24 +40,24 @@ struct LiveTurnControl {
 }
 
 #[derive(Clone)]
-pub struct AppServices {
+pub struct AppServices<Cx: CodexApi = CodexClient, Tg: TelegramApi = TelegramClient> {
     pub config: Config,
     pub storage: Storage,
-    pub telegram: TelegramClient,
+    pub telegram: Tg,
     pub filesystem: FilesystemService,
-    pub codex: CodexClient,
+    pub codex: Cx,
     pub stt: SttClient,
     session_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
     live_turns: Arc<Mutex<HashMap<SessionId, LiveTurnControl>>>,
 }
 
-impl AppServices {
+impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> AppServices<Cx, Tg> {
     pub fn new(
         config: Config,
         storage: Storage,
-        telegram: TelegramClient,
+        telegram: Tg,
         filesystem: FilesystemService,
-        codex: CodexClient,
+        codex: Cx,
         stt: SttClient,
     ) -> Self {
         Self {
@@ -1001,7 +1001,7 @@ impl AppServices {
                 mode,
                 model.as_deref(),
                 reasoning_effort.as_deref(),
-                move |event| {
+                Box::new(move |event| {
                 match event {
                     CodexEvent::ThreadStarted {
                         thread_id,
@@ -1160,7 +1160,8 @@ impl AppServices {
                     }
                 }
                 Ok(())
-            })
+            }),
+            )
             .await;
 
         send_clear_status_update(&telegram_updates_tx);
@@ -1315,7 +1316,7 @@ enum UserInputAdvance {
     },
 }
 
-impl AppServices {
+impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> AppServices<Cx, Tg> {
     async fn apply_user_input_answer(
         &self,
         mut request: PendingUserInput,
@@ -1774,5 +1775,437 @@ mod tests {
                 .callback_data
                 .starts_with("project-history-select:")
         );
+    }
+
+    use super::UserInputCallbackResult;
+    use crate::codex::{CodexApi, CodexEvent, CodexTurnResult, ModelOption};
+    use crate::domain::{
+        ApprovalId, ApprovalStatus, PendingApproval, TelegramUserId, UserInputAnswer,
+    };
+    use crate::error::{AppError, AppResult};
+    use crate::filesystem::FilesystemService;
+    use crate::telegram::{
+        Chat, ChatMember, InlineKeyboardMarkup, Message, TelegramApi, TelegramFile,
+    };
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    #[derive(Clone, Default)]
+    struct FakeCodex {
+        resolved_approvals: Arc<StdMutex<Vec<(SessionId, ApprovalId, bool)>>>,
+        resolved_inputs: Arc<StdMutex<Vec<(SessionId, UserInputRequestId)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CodexApi for FakeCodex {
+        async fn list_models(&self, _workspace_path: &str) -> AppResult<Vec<ModelOption>> {
+            Ok(Vec::new())
+        }
+        async fn run_turn(
+            &self,
+            _session: &SessionRecord,
+            _prompt: &str,
+            _mode: PromptMode,
+            _model: Option<&str>,
+            _reasoning_effort: Option<&str>,
+            _on_event: Box<dyn FnMut(CodexEvent) -> AppResult<()> + Send>,
+        ) -> AppResult<CodexTurnResult> {
+            Ok(CodexTurnResult::default())
+        }
+        async fn resolve_approval(
+            &self,
+            session_id: &SessionId,
+            approval_id: &ApprovalId,
+            approved: bool,
+        ) -> AppResult<()> {
+            self.resolved_approvals.lock().unwrap().push((
+                session_id.clone(),
+                approval_id.clone(),
+                approved,
+            ));
+            Ok(())
+        }
+        async fn resolve_user_input(
+            &self,
+            session_id: &SessionId,
+            request_id: &UserInputRequestId,
+            _answers: HashMap<String, UserInputAnswer>,
+        ) -> AppResult<()> {
+            self.resolved_inputs
+                .lock()
+                .unwrap()
+                .push((session_id.clone(), request_id.clone()));
+            Ok(())
+        }
+        async fn stop_turn(&self, _session_id: &SessionId) -> AppResult<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeTelegram {
+        admin: bool,
+    }
+
+    fn fake_message() -> Message {
+        Message {
+            message_id: 1,
+            chat: Chat {
+                id: 0,
+                kind: "supergroup".into(),
+                title: None,
+            },
+            from: None,
+            text: None,
+            voice: None,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TelegramApi for FakeTelegram {
+        async fn send_message(
+            &self,
+            _chat_id: TelegramChatId,
+            _text: &str,
+            _parse_mode: Option<ParseMode>,
+            _reply_markup: Option<InlineKeyboardMarkup>,
+        ) -> AppResult<Message> {
+            Ok(fake_message())
+        }
+        async fn edit_message_text(
+            &self,
+            _chat_id: TelegramChatId,
+            _message_id: i64,
+            _text: &str,
+            _parse_mode: Option<ParseMode>,
+            _reply_markup: Option<InlineKeyboardMarkup>,
+        ) -> AppResult<Message> {
+            Ok(fake_message())
+        }
+        async fn delete_message(
+            &self,
+            _chat_id: TelegramChatId,
+            _message_id: i64,
+        ) -> AppResult<bool> {
+            Ok(true)
+        }
+        async fn get_chat_member(
+            &self,
+            _chat_id: TelegramChatId,
+            _user_id: TelegramUserId,
+        ) -> AppResult<ChatMember> {
+            Ok(ChatMember {
+                status: if self.admin {
+                    "administrator".into()
+                } else {
+                    "member".into()
+                },
+            })
+        }
+        async fn get_file(&self, _file_id: &str) -> AppResult<TelegramFile> {
+            Ok(TelegramFile { file_path: None })
+        }
+        async fn download_file_bytes(&self, _file_path: &str) -> AppResult<Vec<u8>> {
+            Ok(Vec::new())
+        }
+    }
+
+    async fn services_with_fakes(admin: bool) -> (AppServices<FakeCodex, FakeTelegram>, FakeCodex) {
+        let storage = Storage::connect("sqlite::memory:").await.unwrap();
+        let codex = FakeCodex::default();
+        let services = AppServices::new(
+            test_config(),
+            storage,
+            FakeTelegram { admin },
+            FilesystemService::default(),
+            codex.clone(),
+            SttClient::Disabled,
+        );
+        (services, codex)
+    }
+
+    fn seed_session(chat_id: TelegramChatId) -> SessionRecord {
+        SessionRecord {
+            session_id: SessionId::new(),
+            chat_id,
+            workspace_path: WorkspacePath("/tmp".into()),
+            backend: SessionBackend::AppServer,
+            provider_thread_id: None,
+            resume_cursor_json: None,
+            status: SessionStatus::WaitingForApproval,
+            last_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn pending_approval(
+        session_id: SessionId,
+        chat_id: TelegramChatId,
+        status: ApprovalStatus,
+    ) -> PendingApproval {
+        PendingApproval {
+            approval_id: ApprovalId::new(),
+            session_id,
+            chat_id,
+            payload: "{}".into(),
+            summary: "run a command".into(),
+            status,
+            created_at: Utc::now(),
+            resolved_by: None,
+        }
+    }
+
+    fn pending_user_input(
+        session_id: SessionId,
+        chat_id: TelegramChatId,
+        question_count: usize,
+    ) -> PendingUserInput {
+        let questions = (0..question_count)
+            .map(|index| UserInputQuestion {
+                id: format!("q{index}"),
+                header: format!("Q{index}"),
+                question: format!("Question {index}?"),
+                is_other: false,
+                is_secret: false,
+                options: Some(vec![
+                    UserInputOption {
+                        label: "Yes".into(),
+                        description: "Affirmative.".into(),
+                    },
+                    UserInputOption {
+                        label: "No".into(),
+                        description: "Negative.".into(),
+                    },
+                ]),
+            })
+            .collect();
+        PendingUserInput {
+            request_id: UserInputRequestId::new(),
+            session_id,
+            chat_id,
+            questions,
+            answers: HashMap::new(),
+            status: UserInputStatus::Pending,
+            created_at: Utc::now(),
+            resolved_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_approval_approves_and_forwards_to_codex() {
+        let chat_id = TelegramChatId(7);
+        let (services, codex) = services_with_fakes(true).await;
+        let session = seed_session(chat_id);
+        services.storage.insert_session(&session).await.unwrap();
+        let approval = pending_approval(session.session_id.clone(), chat_id, ApprovalStatus::Pending);
+        services
+            .storage
+            .insert_pending_approval(&approval)
+            .await
+            .unwrap();
+
+        let message = services
+            .resolve_approval(approval.approval_id.clone(), chat_id, TelegramUserId(1), true)
+            .await
+            .unwrap();
+
+        assert_eq!(message, "Approval sent to Codex.");
+        let forwarded = codex.resolved_approvals.lock().unwrap().clone();
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0].1, approval.approval_id);
+        assert!(forwarded[0].2);
+        let stored = services
+            .storage
+            .get_pending_approval(&approval.approval_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, ApprovalStatus::Approved);
+    }
+
+    #[tokio::test]
+    async fn resolve_approval_rejection_forwards_rejection_to_codex() {
+        let chat_id = TelegramChatId(7);
+        let (services, codex) = services_with_fakes(true).await;
+        let session = seed_session(chat_id);
+        services.storage.insert_session(&session).await.unwrap();
+        let approval = pending_approval(session.session_id.clone(), chat_id, ApprovalStatus::Pending);
+        services
+            .storage
+            .insert_pending_approval(&approval)
+            .await
+            .unwrap();
+
+        let message = services
+            .resolve_approval(approval.approval_id.clone(), chat_id, TelegramUserId(1), false)
+            .await
+            .unwrap();
+
+        assert_eq!(message, "Rejection sent to Codex.");
+        assert!(!codex.resolved_approvals.lock().unwrap()[0].2);
+        let stored = services
+            .storage
+            .get_pending_approval(&approval.approval_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, ApprovalStatus::Rejected);
+    }
+
+    #[tokio::test]
+    async fn resolve_approval_requires_group_admin() {
+        let chat_id = TelegramChatId(7);
+        let (services, codex) = services_with_fakes(false).await;
+        let session = seed_session(chat_id);
+        services.storage.insert_session(&session).await.unwrap();
+        let approval = pending_approval(session.session_id.clone(), chat_id, ApprovalStatus::Pending);
+        services
+            .storage
+            .insert_pending_approval(&approval)
+            .await
+            .unwrap();
+
+        let result = services
+            .resolve_approval(approval.approval_id.clone(), chat_id, TelegramUserId(1), true)
+            .await;
+
+        assert!(matches!(result, Err(AppError::Validation(_))));
+        // A non-admin click must never reach Codex.
+        assert!(codex.resolved_approvals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_approval_rejects_foreign_chat() {
+        let chat_id = TelegramChatId(7);
+        let (services, codex) = services_with_fakes(true).await;
+        let session = seed_session(chat_id);
+        services.storage.insert_session(&session).await.unwrap();
+        let approval = pending_approval(session.session_id.clone(), chat_id, ApprovalStatus::Pending);
+        services
+            .storage
+            .insert_pending_approval(&approval)
+            .await
+            .unwrap();
+
+        let result = services
+            .resolve_approval(
+                approval.approval_id.clone(),
+                TelegramChatId(999),
+                TelegramUserId(1),
+                true,
+            )
+            .await;
+
+        assert!(matches!(result, Err(AppError::Validation(_))));
+        assert!(codex.resolved_approvals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_approval_rejects_already_resolved() {
+        let chat_id = TelegramChatId(7);
+        let (services, codex) = services_with_fakes(true).await;
+        let session = seed_session(chat_id);
+        services.storage.insert_session(&session).await.unwrap();
+        let approval =
+            pending_approval(session.session_id.clone(), chat_id, ApprovalStatus::Approved);
+        services
+            .storage
+            .insert_pending_approval(&approval)
+            .await
+            .unwrap();
+
+        let result = services
+            .resolve_approval(approval.approval_id.clone(), chat_id, TelegramUserId(1), true)
+            .await;
+
+        assert!(matches!(result, Err(AppError::Validation(_))));
+        assert!(codex.resolved_approvals.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_user_input_advances_to_next_question() {
+        let chat_id = TelegramChatId(7);
+        let (services, codex) = services_with_fakes(true).await;
+        let session = seed_session(chat_id);
+        services.storage.insert_session(&session).await.unwrap();
+        let request = pending_user_input(session.session_id.clone(), chat_id, 2);
+        services
+            .storage
+            .insert_pending_user_input(&request)
+            .await
+            .unwrap();
+
+        let result = services
+            .resolve_user_input_choice(
+                request.request_id.clone(),
+                chat_id,
+                TelegramUserId(1),
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(result, UserInputCallbackResult::Render(_, _)));
+        // Codex is only answered once every question is resolved.
+        assert!(codex.resolved_inputs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_user_input_completes_and_forwards_to_codex() {
+        let chat_id = TelegramChatId(7);
+        let (services, codex) = services_with_fakes(true).await;
+        let session = seed_session(chat_id);
+        services.storage.insert_session(&session).await.unwrap();
+        let request = pending_user_input(session.session_id.clone(), chat_id, 1);
+        services
+            .storage
+            .insert_pending_user_input(&request)
+            .await
+            .unwrap();
+
+        let result = services
+            .resolve_user_input_choice(
+                request.request_id.clone(),
+                chat_id,
+                TelegramUserId(1),
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(result, UserInputCallbackResult::Replace(_)));
+        let forwarded = codex.resolved_inputs.lock().unwrap().clone();
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0].1, request.request_id);
+    }
+
+    #[tokio::test]
+    async fn resolve_user_input_rejects_out_of_order_answer() {
+        let chat_id = TelegramChatId(7);
+        let (services, codex) = services_with_fakes(true).await;
+        let session = seed_session(chat_id);
+        services.storage.insert_session(&session).await.unwrap();
+        let request = pending_user_input(session.session_id.clone(), chat_id, 2);
+        services
+            .storage
+            .insert_pending_user_input(&request)
+            .await
+            .unwrap();
+
+        // Answering question index 1 while index 0 is still pending must be rejected.
+        let result = services
+            .resolve_user_input_choice(
+                request.request_id.clone(),
+                chat_id,
+                TelegramUserId(1),
+                1,
+                0,
+            )
+            .await;
+
+        assert!(matches!(result, Err(AppError::Validation(_))));
+        assert!(codex.resolved_inputs.lock().unwrap().is_empty());
     }
 }

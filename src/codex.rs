@@ -357,6 +357,82 @@ impl CodexClient {
     }
 }
 
+/// Seam over the Codex app-server adapter so business logic in `services` can be
+/// exercised against a fake without spawning a real `codex` process. The boxed
+/// callback (rather than a generic closure) keeps the trait object-friendly and
+/// lets the async future stay `Send`.
+#[async_trait::async_trait]
+pub(crate) trait CodexApi: Clone + Send + Sync {
+    async fn list_models(&self, workspace_path: &str) -> AppResult<Vec<ModelOption>>;
+
+    async fn run_turn(
+        &self,
+        session: &SessionRecord,
+        prompt: &str,
+        mode: PromptMode,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+        on_event: Box<dyn FnMut(CodexEvent) -> AppResult<()> + Send>,
+    ) -> AppResult<CodexTurnResult>;
+
+    async fn resolve_approval(
+        &self,
+        session_id: &SessionId,
+        approval_id: &ApprovalId,
+        approved: bool,
+    ) -> AppResult<()>;
+
+    async fn resolve_user_input(
+        &self,
+        session_id: &SessionId,
+        request_id: &UserInputRequestId,
+        answers: HashMap<String, UserInputAnswer>,
+    ) -> AppResult<()>;
+
+    async fn stop_turn(&self, session_id: &SessionId) -> AppResult<()>;
+}
+
+#[async_trait::async_trait]
+impl CodexApi for CodexClient {
+    async fn list_models(&self, workspace_path: &str) -> AppResult<Vec<ModelOption>> {
+        CodexClient::list_models(self, workspace_path).await
+    }
+
+    async fn run_turn(
+        &self,
+        session: &SessionRecord,
+        prompt: &str,
+        mode: PromptMode,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+        on_event: Box<dyn FnMut(CodexEvent) -> AppResult<()> + Send>,
+    ) -> AppResult<CodexTurnResult> {
+        CodexClient::run_turn(self, session, prompt, mode, model, reasoning_effort, on_event).await
+    }
+
+    async fn resolve_approval(
+        &self,
+        session_id: &SessionId,
+        approval_id: &ApprovalId,
+        approved: bool,
+    ) -> AppResult<()> {
+        CodexClient::resolve_approval(self, session_id, approval_id, approved).await
+    }
+
+    async fn resolve_user_input(
+        &self,
+        session_id: &SessionId,
+        request_id: &UserInputRequestId,
+        answers: HashMap<String, UserInputAnswer>,
+    ) -> AppResult<()> {
+        CodexClient::resolve_user_input(self, session_id, request_id, answers).await
+    }
+
+    async fn stop_turn(&self, session_id: &SessionId) -> AppResult<()> {
+        CodexClient::stop_turn(self, session_id).await
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CodexTurnResult {
     pub thread_id: Option<CodexThreadId>,

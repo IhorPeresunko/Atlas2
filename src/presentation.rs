@@ -14,7 +14,7 @@ use crate::{
         UserInputOption,
     },
     error::{AppError, AppResult},
-    telegram::{InlineKeyboardMarkup, ParseMode, TelegramClient, button},
+    telegram::{InlineKeyboardMarkup, ParseMode, TelegramApi, button},
 };
 
 pub(crate) const TELEGRAM_TEXT_LIMIT: usize = 3900;
@@ -248,8 +248,8 @@ pub(crate) fn send_command_finished_update(
     let _ = telegram_updates_tx.send(TelegramTurnUpdate::Message(message));
 }
 
-pub(crate) async fn send_telegram_update(
-    telegram: &TelegramClient,
+pub(crate) async fn send_telegram_update<T: TelegramApi>(
+    telegram: &T,
     chat_id: TelegramChatId,
     delivery_state: &mut TelegramTurnDeliveryState,
     update: TelegramTurnUpdate,
@@ -289,8 +289,8 @@ pub(crate) async fn send_telegram_update(
     Ok(())
 }
 
-async fn upsert_status_message(
-    telegram: &TelegramClient,
+async fn upsert_status_message<T: TelegramApi>(
+    telegram: &T,
     chat_id: TelegramChatId,
     delivery_state: &mut TelegramTurnDeliveryState,
     message: TelegramMessage,
@@ -313,8 +313,8 @@ async fn upsert_status_message(
     Ok(())
 }
 
-async fn clear_status_message(
-    telegram: &TelegramClient,
+async fn clear_status_message<T: TelegramApi>(
+    telegram: &T,
     chat_id: TelegramChatId,
     delivery_state: &mut TelegramTurnDeliveryState,
 ) -> AppResult<()> {

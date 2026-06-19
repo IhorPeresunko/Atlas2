@@ -129,7 +129,9 @@ impl App {
                         );
                         let services = self.services.clone();
                         tokio::spawn(async move {
-                            if let Err(error) = services.run_plan_prompt(chat_id, &prompt).await {
+                            if let Err(error) =
+                                services.turns.run_plan_prompt(chat_id, &prompt).await
+                            {
                                 tracing::error!(
                                     chat_id = chat_id.0,
                                     error = %error,
@@ -191,7 +193,9 @@ impl App {
                         let prompt = prompt.to_string();
                         let services = self.services.clone();
                         tokio::spawn(async move {
-                            if let Err(error) = services.run_plan_prompt(chat_id, &prompt).await {
+                            if let Err(error) =
+                                services.turns.run_plan_prompt(chat_id, &prompt).await
+                            {
                                 tracing::error!(
                                     chat_id = chat_id.0,
                                     error = %error,
@@ -266,7 +270,7 @@ impl App {
                         let prompt = prompt.to_string();
                         let services = self.services.clone();
                         tokio::spawn(async move {
-                            if let Err(error) = services.run_prompt(chat_id, &prompt).await {
+                            if let Err(error) = services.turns.run_prompt(chat_id, &prompt).await {
                                 tracing::error!(
                                     chat_id = chat_id.0,
                                     error = %error,
@@ -300,6 +304,7 @@ impl App {
                 let services = self.services.clone();
                 tokio::spawn(async move {
                     if let Err(error) = services
+                        .turns
                         .run_voice_prompt(
                             chat_id,
                             &voice.file_id,
@@ -362,7 +367,10 @@ impl App {
                     crate::domain::SessionId(uuid::Uuid::parse_str(id).map_err(|error| {
                         AppError::Validation(format!("invalid session ID in callback: {error}"))
                     })?);
-                self.services.stop_turn(session_id, chat_id, user_id).await
+                self.services
+                    .turns
+                    .stop_turn(session_id, chat_id, user_id)
+                    .await
             } else if let Some(rest) = data.strip_prefix("user-input-answer:") {
                 let mut parts = rest.split(':');
                 let request_id = parts
@@ -453,7 +461,7 @@ impl App {
                             .await?;
                         let services = self.services.clone();
                         tokio::spawn(async move {
-                            if let Err(error) = services.run_prompt(chat_id, &prompt).await {
+                            if let Err(error) = services.turns.run_prompt(chat_id, &prompt).await {
                                 let _ = services
                                     .telegram
                                     .send_message(

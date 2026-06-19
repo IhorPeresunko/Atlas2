@@ -1,41 +1,28 @@
-use std::{collections::HashMap, sync::Arc};
-
-use chrono::Utc;
-use tokio::sync::{Mutex, OwnedMutexGuard, mpsc::unbounded_channel};
-
 use crate::{
-    codex::{CodexApi, CodexClient, CodexEvent},
+    codex::{CodexApi, CodexClient},
     config::Config,
-    domain::{
-        ApprovalStatus, PendingApproval, PendingPlanFollowUp, PendingUserInput, PlanFollowUpId,
-        PlanFollowUpStatus, PromptMode, SessionBackend, SessionId, SessionRecord, SessionStatus,
-        TelegramChatId, TelegramUserId, UserInputStatus,
-    },
+    domain::{TelegramChatId, TelegramUserId},
     error::{AppError, AppResult},
     filesystem::FilesystemService,
-    presentation::{
-        TelegramMessage, TelegramTurnDeliveryState, TelegramTurnUpdate, TurnTerminalState,
-        plan_follow_up_markup, render_command_finished_message, render_turn_terminal_text,
-        render_user_input_prompt, render_voice_transcript_message, send_clear_status_update,
-        send_command_finished_update, send_status_update, send_telegram_update, send_text_update,
-        turn_control_markup, user_input_markup,
-    },
     storage::Storage,
     stt::SttClient,
-    telegram::{InlineKeyboardMarkup, TelegramApi, TelegramClient, button},
+    telegram::{TelegramApi, TelegramClient},
 };
 
 mod approval;
 mod folder;
 mod model;
 mod plan;
+mod turn;
 mod user_input;
 
 pub use approval::ApprovalService;
 pub use folder::{FolderCallbackResult, FolderService};
 pub use model::{ModelCallbackResult, ModelService};
+#[cfg(test)]
 pub(crate) use plan::build_plan_implementation_prompt;
 pub use plan::{PlanFollowUpCallbackResult, PlanService};
+pub use turn::TurnService;
 pub use user_input::{UserInputCallbackResult, UserInputService, UserInputTextResult};
 
 /// Shared authorization helper: a chat action is allowed only for Telegram group
@@ -54,27 +41,17 @@ pub(crate) async fn require_group_admin<Tg: TelegramApi>(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct LiveTurnControl {
-    chat_id: TelegramChatId,
-    control_message_id: i64,
-    stop_requested: bool,
-}
-
 #[derive(Clone)]
 pub struct AppServices<Cx: CodexApi = CodexClient, Tg: TelegramApi = TelegramClient> {
     pub config: Config,
     pub storage: Storage,
     pub telegram: Tg,
-    pub codex: Cx,
-    pub stt: SttClient,
-    session_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
-    live_turns: Arc<Mutex<HashMap<SessionId, LiveTurnControl>>>,
     pub folder: FolderService<Cx, Tg>,
     pub model: ModelService<Cx>,
     pub approvals: ApprovalService<Cx, Tg>,
     pub user_input: UserInputService<Cx, Tg>,
     pub plans: PlanService<Tg>,
+    pub turns: TurnService<Cx, Tg>,
 }
 
 impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> AppServices<Cx, Tg> {
@@ -97,19 +74,17 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> AppServices<Cx, Tg> {
         let approvals = ApprovalService::new(storage.clone(), telegram.clone(), codex.clone());
         let user_input = UserInputService::new(storage.clone(), telegram.clone(), codex.clone());
         let plans = PlanService::new(storage.clone(), telegram.clone());
+        let turns = TurnService::new(storage.clone(), telegram.clone(), codex, stt, model.clone());
         Self {
             config,
             storage,
             telegram,
-            codex,
-            stt,
-            session_locks: Arc::new(Mutex::new(HashMap::new())),
-            live_turns: Arc::new(Mutex::new(HashMap::new())),
             folder,
             model,
             approvals,
             user_input,
             plans,
+            turns,
         }
     }
 
@@ -156,491 +131,6 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> AppServices<Cx, Tg> {
             ));
         }
         Ok(lines.join("\n"))
-    }
-
-    pub async fn run_prompt(&self, chat_id: TelegramChatId, prompt: &str) -> AppResult<()> {
-        self.run_prompt_with_mode(chat_id, prompt, PromptMode::Normal)
-            .await
-    }
-
-    pub async fn stop_turn(
-        &self,
-        session_id: SessionId,
-        chat_id: TelegramChatId,
-        user_id: TelegramUserId,
-    ) -> AppResult<String> {
-        self.require_group_admin(chat_id, user_id).await?;
-
-        let session = self.require_active_session(chat_id).await?;
-        if session.session_id != session_id {
-            return Err(AppError::Validation("turn is no longer active".into()));
-        }
-
-        {
-            let mut live_turns = self.live_turns.lock().await;
-            let live_turn = live_turns
-                .get_mut(&session_id)
-                .ok_or_else(|| AppError::Validation("turn is no longer running".into()))?;
-            if live_turn.chat_id != chat_id {
-                return Err(AppError::Validation(
-                    "turn belongs to a different chat".into(),
-                ));
-            }
-            if live_turn.stop_requested {
-                return Err(AppError::Validation(
-                    "turn stop is already in progress".into(),
-                ));
-            }
-            live_turn.stop_requested = true;
-        }
-
-        if let Err(error) = self.codex.stop_turn(&session_id).await {
-            let mut live_turns = self.live_turns.lock().await;
-            if let Some(live_turn) = live_turns.get_mut(&session_id) {
-                live_turn.stop_requested = false;
-            }
-            return Err(error);
-        }
-
-        self.storage
-            .expire_pending_approvals_for_session(&session_id)
-            .await?;
-        self.storage
-            .expire_pending_user_inputs_for_session(&session_id)
-            .await?;
-
-        Ok("Stopping Codex turn.".into())
-    }
-
-    pub async fn run_plan_prompt(&self, chat_id: TelegramChatId, prompt: &str) -> AppResult<()> {
-        self.run_prompt_with_mode(chat_id, prompt, PromptMode::Plan)
-            .await
-    }
-
-    pub async fn run_voice_prompt(
-        &self,
-        chat_id: TelegramChatId,
-        file_id: &str,
-        file_unique_id: &str,
-        mime_type: Option<&str>,
-    ) -> AppResult<()> {
-        let _guard = self.acquire_session_lock(chat_id).await;
-        self.require_active_session(chat_id).await?;
-
-        let file = self.telegram.get_file(file_id).await?;
-        let file_path = file.file_path.ok_or_else(|| {
-            AppError::Telegram("telegram getFile returned no file_path for voice message".into())
-        })?;
-        let audio_bytes = self.telegram.download_file_bytes(&file_path).await?;
-        let mime_type = mime_type.unwrap_or("audio/ogg");
-        let transcript = self
-            .stt
-            .transcribe_voice(&format!("{file_unique_id}.oga"), mime_type, audio_bytes)
-            .await?;
-
-        self.telegram
-            .send_message(
-                chat_id,
-                &render_voice_transcript_message(&transcript),
-                None,
-                None,
-            )
-            .await?;
-
-        self.run_prompt_with_mode_locked(chat_id, &transcript, PromptMode::Normal)
-            .await
-    }
-
-    async fn run_prompt_with_mode(
-        &self,
-        chat_id: TelegramChatId,
-        prompt: &str,
-        mode: PromptMode,
-    ) -> AppResult<()> {
-        let _guard = self.acquire_session_lock(chat_id).await;
-        self.run_prompt_with_mode_locked(chat_id, prompt, mode)
-            .await
-    }
-
-    async fn run_prompt_with_mode_locked(
-        &self,
-        chat_id: TelegramChatId,
-        prompt: &str,
-        mode: PromptMode,
-    ) -> AppResult<()> {
-        let chat_binding = self.storage.get_chat(chat_id).await?;
-        let (mut model, reasoning_effort) = chat_binding
-            .map(|chat| (chat.model, chat.reasoning_effort))
-            .unwrap_or((None, None));
-        let session = self.require_active_session(chat_id).await?;
-        // The Codex app-server rejects a turn without a model. Resolve and
-        // persist its default when the chat has none (e.g. a brand-new chat).
-        if model.is_none() {
-            model = self
-                .model
-                .ensure_chat_model(chat_id, &session.workspace_path.0)
-                .await?;
-        }
-        tracing::info!(
-            chat_id = chat_id.0,
-            session_id = %session.session_id.0,
-            mode = ?mode,
-            workspace_path = session.workspace_path.0,
-            prompt_chars = prompt.chars().count(),
-            "starting Codex prompt"
-        );
-        if session.backend != SessionBackend::AppServer {
-            return Err(AppError::Validation(
-                "this session was created before the app-server migration and cannot continue; run /new to start a fresh session".into(),
-            ));
-        }
-
-        self.storage
-            .update_session_status(&session.session_id, SessionStatus::Running, None)
-            .await?;
-        let control_message = self
-            .telegram
-            .send_message(
-                chat_id,
-                "Codex turn running.",
-                None,
-                Some(turn_control_markup(&session.session_id)),
-            )
-            .await?;
-        self.live_turns.lock().await.insert(
-            session.session_id.clone(),
-            LiveTurnControl {
-                chat_id,
-                control_message_id: control_message.message_id,
-                stop_requested: false,
-            },
-        );
-        let telegram = self.telegram.clone();
-        let storage = self.storage.clone();
-        let session_id = session.session_id.clone();
-        let chat_id_copy = chat_id;
-        let (telegram_updates_tx, mut telegram_updates_rx) = unbounded_channel();
-        let telegram_sender = tokio::spawn(async move {
-            let mut delivery_state = TelegramTurnDeliveryState::default();
-            while let Some(update) = telegram_updates_rx.recv().await {
-                let _ = send_telegram_update(&telegram, chat_id_copy, &mut delivery_state, update)
-                    .await;
-            }
-        });
-
-        send_status_update(&telegram_updates_tx, "Starting Codex turn...");
-        let event_updates_tx = telegram_updates_tx.clone();
-
-        let result = self
-            .codex
-            .run_turn(
-                &session,
-                prompt,
-                mode,
-                model.as_deref(),
-                reasoning_effort.as_deref(),
-                Box::new(move |event| {
-                match event {
-                    CodexEvent::ThreadStarted {
-                        thread_id,
-                        resume_cursor_json,
-                    } => {
-                        let storage = storage.clone();
-                        let session_id = session_id.clone();
-                        tokio::spawn(async move {
-                            let _ = storage
-                                .update_session_provider_state(
-                                    &session_id,
-                                    Some(&thread_id),
-                                    resume_cursor_json.as_deref(),
-                                )
-                                .await;
-                        });
-                    }
-                    CodexEvent::Status { text } => {
-                        send_status_update(&event_updates_tx, format!("Status: {text}"));
-                    }
-                    CodexEvent::Output { text } => {
-                        send_text_update(&event_updates_tx, text);
-                    }
-                    CodexEvent::CommandStarted { command } => {
-                        send_text_update(
-                            &event_updates_tx,
-                            format!("Running command:\n`{command}`"),
-                        );
-                    }
-                    CodexEvent::CommandFinished {
-                        command,
-                        exit_code,
-                        output,
-                    } => {
-                        send_command_finished_update(
-                            &event_updates_tx,
-                            render_command_finished_message(&command, exit_code, &output),
-                        );
-                    }
-                    CodexEvent::ApprovalRequested { approval } => {
-                        let storage = storage.clone();
-                        let session_id = session_id.clone();
-                        let telegram_updates_tx = event_updates_tx.clone();
-                        tokio::spawn(async move {
-                            let _ = storage
-                                .update_session_status(
-                                    &session_id,
-                                    SessionStatus::WaitingForApproval,
-                                    None,
-                                )
-                                .await;
-                            let pending = PendingApproval {
-                                approval_id: approval.approval_id.clone(),
-                                session_id,
-                                chat_id: chat_id_copy,
-                                payload: approval.payload,
-                                summary: approval.summary,
-                                status: ApprovalStatus::Pending,
-                                created_at: Utc::now(),
-                                resolved_by: None,
-                            };
-                            let _ = storage.insert_pending_approval(&pending).await;
-                            let markup = InlineKeyboardMarkup {
-                                inline_keyboard: vec![vec![
-                                    button(
-                                        "Approve",
-                                        format!("approval-approve:{}", pending.approval_id.0),
-                                    ),
-                                    button(
-                                        "Reject",
-                                        format!("approval-reject:{}", pending.approval_id.0),
-                                    ),
-                                ]],
-                            };
-                            let _ = telegram_updates_tx.send(TelegramTurnUpdate::Approval {
-                                summary: pending.summary,
-                                markup,
-                            });
-                        });
-                    }
-                    CodexEvent::UserInputRequested { request } => {
-                        let storage = storage.clone();
-                        let session_id = session_id.clone();
-                        let telegram_updates_tx = event_updates_tx.clone();
-                        tokio::spawn(async move {
-                            let _ = storage
-                                .update_session_status(
-                                    &session_id,
-                                    SessionStatus::WaitingForInput,
-                                    None,
-                                )
-                                .await;
-                            let pending = PendingUserInput {
-                                request_id: request.request_id.clone(),
-                                session_id,
-                                chat_id: chat_id_copy,
-                                questions: request.questions,
-                                answers: HashMap::new(),
-                                status: UserInputStatus::Pending,
-                                created_at: Utc::now(),
-                                resolved_by: None,
-                            };
-                            let _ = storage.insert_pending_user_input(&pending).await;
-                            if let Ok(markup) = user_input_markup(&pending) {
-                                let _ = telegram_updates_tx.send(TelegramTurnUpdate::UserInput {
-                                    text: render_user_input_prompt(&pending),
-                                    markup,
-                                });
-                            }
-                        });
-                    }
-                    CodexEvent::PlanCompleted { markdown } => {
-                        if mode != PromptMode::Plan {
-                            send_text_update(&event_updates_tx, markdown);
-                            return Ok(());
-                        }
-                        let storage = storage.clone();
-                        let session_id = session_id.clone();
-                        let telegram_updates_tx = event_updates_tx.clone();
-                        tokio::spawn(async move {
-                            let _ = storage
-                                .expire_pending_plan_follow_ups_for_session(&session_id)
-                                .await;
-                            let follow_up = PendingPlanFollowUp {
-                                follow_up_id: PlanFollowUpId::new(),
-                                session_id,
-                                chat_id: chat_id_copy,
-                                plan_markdown: markdown.clone(),
-                                status: PlanFollowUpStatus::Pending,
-                                created_at: Utc::now(),
-                                resolved_by: None,
-                            };
-                            let _ = storage.insert_pending_plan_follow_up(&follow_up).await;
-                            let _ = telegram_updates_tx.send(TelegramTurnUpdate::Message(
-                                TelegramMessage {
-                                    text: markdown,
-                                    parse_mode: None,
-                                },
-                            ));
-                            let _ = telegram_updates_tx.send(TelegramTurnUpdate::PlanFollowUp {
-                                text: "Plan ready. Implement it now or send more details to refine it."
-                                    .into(),
-                                markup: plan_follow_up_markup(&follow_up),
-                            });
-                        });
-                    }
-                    CodexEvent::TurnCompleted => {}
-                    CodexEvent::TurnInterrupted { message } => {
-                        let _ = message;
-                    }
-                    CodexEvent::TurnFailed { message } => {
-                        send_text_update(
-                            &event_updates_tx,
-                            format!("Codex turn failed: {message}"),
-                        );
-                    }
-                }
-                Ok(())
-            }),
-            )
-            .await;
-
-        send_clear_status_update(&telegram_updates_tx);
-        drop(telegram_updates_tx);
-        let _ = telegram_sender.await;
-
-        match result {
-            Ok(result) => {
-                tracing::info!(
-                    chat_id = chat_id.0,
-                    session_id = %session.session_id.0,
-                    completed = result.completed,
-                    interrupted = result.interrupted,
-                    has_failure = result.failure.is_some(),
-                    thread_id = result.thread_id.as_ref().map(|id| id.0.as_str()).unwrap_or(""),
-                    "Codex prompt finished"
-                );
-                let live_turn = self.live_turns.lock().await.remove(&session.session_id);
-                let terminal_state = match &live_turn {
-                    Some(live_turn) if live_turn.stop_requested => TurnTerminalState::Stopped,
-                    Some(_) if result.interrupted => TurnTerminalState::Interrupted,
-                    Some(_) if result.failure.is_some() => TurnTerminalState::Failed,
-                    Some(_) => TurnTerminalState::Completed,
-                    None if result.interrupted => TurnTerminalState::Interrupted,
-                    None if result.failure.is_some() => TurnTerminalState::Failed,
-                    None => TurnTerminalState::Completed,
-                };
-                if let Some(live_turn) = live_turn {
-                    if let Err(error) = self
-                        .finish_turn_control(live_turn, terminal_state, result.failure.as_deref())
-                        .await
-                    {
-                        tracing::warn!(
-                            chat_id = chat_id.0,
-                            session_id = %session.session_id.0,
-                            error = %error,
-                            "failed to update Telegram turn control message"
-                        );
-                    }
-                }
-                if let Some(thread_id) = result.thread_id.as_ref() {
-                    self.storage
-                        .update_session_provider_state(
-                            &session.session_id,
-                            Some(&thread_id),
-                            result.resume_cursor_json.as_deref(),
-                        )
-                        .await?;
-                }
-                if terminal_state == TurnTerminalState::Stopped
-                    || terminal_state == TurnTerminalState::Interrupted
-                {
-                    self.storage
-                        .update_session_status(&session.session_id, SessionStatus::Ready, None)
-                        .await?;
-                } else if let Some(message) = result.failure {
-                    self.storage
-                        .update_session_status(
-                            &session.session_id,
-                            SessionStatus::Failed,
-                            Some(&message),
-                        )
-                        .await?;
-                } else {
-                    self.storage
-                        .update_session_status(&session.session_id, SessionStatus::Ready, None)
-                        .await?;
-                }
-                Ok(())
-            }
-            Err(error) => {
-                tracing::error!(
-                    chat_id = chat_id.0,
-                    session_id = %session.session_id.0,
-                    error = %error,
-                    "Codex prompt execution failed"
-                );
-                let live_turn = self.live_turns.lock().await.remove(&session.session_id);
-                if let Some(live_turn) = live_turn {
-                    let _ = self
-                        .finish_turn_control(
-                            live_turn,
-                            TurnTerminalState::Failed,
-                            Some(&error.to_string()),
-                        )
-                        .await;
-                }
-                self.storage
-                    .update_session_status(
-                        &session.session_id,
-                        SessionStatus::Failed,
-                        Some(&error.to_string()),
-                    )
-                    .await?;
-                let message = format!("Codex execution failed: {error}");
-                self.telegram
-                    .send_message(chat_id, &message, None, None)
-                    .await?;
-                Err(error)
-            }
-        }
-    }
-
-    async fn acquire_session_lock(&self, chat_id: TelegramChatId) -> OwnedMutexGuard<()> {
-        let arc = {
-            let mut locks = self.session_locks.lock().await;
-            locks
-                .entry(chat_id.0)
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
-        arc.lock_owned().await
-    }
-
-    async fn require_active_session(&self, chat_id: TelegramChatId) -> AppResult<SessionRecord> {
-        self.storage
-            .get_active_session_for_chat(chat_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::Validation(
-                    "this group does not have an active session; run /new first".into(),
-                )
-            })
-    }
-
-    async fn finish_turn_control(
-        &self,
-        live_turn: LiveTurnControl,
-        state: TurnTerminalState,
-        detail: Option<&str>,
-    ) -> AppResult<()> {
-        self.telegram
-            .edit_message_text(
-                live_turn.chat_id,
-                live_turn.control_message_id,
-                &render_turn_terminal_text(state, detail),
-                None,
-                None,
-            )
-            .await?;
-        Ok(())
     }
 }
 
@@ -1465,5 +955,47 @@ mod tests {
 
         assert!(matches!(result, Err(AppError::Validation(_))));
         assert!(codex.resolved_inputs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_turn_requires_group_admin() {
+        let chat_id = TelegramChatId(7);
+        let (services, _codex) = services_with_fakes(false).await;
+        let session = seed_session(chat_id);
+        services.storage.insert_session(&session).await.unwrap();
+
+        let result = services
+            .turns
+            .stop_turn(session.session_id.clone(), chat_id, TelegramUserId(1))
+            .await;
+
+        assert!(matches!(result, Err(AppError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn stop_turn_rejects_when_no_turn_is_live() {
+        let chat_id = TelegramChatId(7);
+        let (services, _codex) = services_with_fakes(true).await;
+        let session = seed_session(chat_id);
+        services.storage.insert_session(&session).await.unwrap();
+        services
+            .storage
+            .set_active_session(chat_id, Some(&session.session_id))
+            .await
+            .unwrap();
+
+        // Active session, but no turn registered as live -> rejected.
+        let result = services
+            .turns
+            .stop_turn(session.session_id.clone(), chat_id, TelegramUserId(1))
+            .await;
+        assert!(matches!(result, Err(AppError::Validation(_))));
+
+        // A session id that is not the active one -> "turn is no longer active".
+        let result = services
+            .turns
+            .stop_turn(SessionId::new(), chat_id, TelegramUserId(1))
+            .await;
+        assert!(matches!(result, Err(AppError::Validation(_))));
     }
 }

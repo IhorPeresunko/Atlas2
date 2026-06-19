@@ -11,7 +11,11 @@ use directories::ProjectDirs;
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "atlas2", version, about = "Telegram bridge for local Codex sessions")]
+#[command(
+    name = "atlas2",
+    version,
+    about = "Telegram bridge for local Codex sessions"
+)]
 pub struct CliArgs {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -164,7 +168,11 @@ pub fn stored_telegram_bot_token() -> AppResult<Option<String>> {
 /// Reads the persisted ElevenLabs API key without prompting, mirroring
 /// [`stored_telegram_bot_token`].
 pub fn stored_stt_api_key() -> AppResult<Option<String>> {
-    read_credential("ATLAS2_STT_API_KEY_FILE", "stt_api_key", "ElevenLabs API key")
+    read_credential(
+        "ATLAS2_STT_API_KEY_FILE",
+        "stt_api_key",
+        "ElevenLabs API key",
+    )
 }
 
 /// Persists a configuration secret addressed by a short key, mirroring the
@@ -196,9 +204,11 @@ fn load_stt_api_key(cli_value: Option<String>) -> AppResult<String> {
         return normalize_secret(value, "ElevenLabs API key");
     }
 
-    if let Some(key) =
-        read_credential("ATLAS2_STT_API_KEY_FILE", "stt_api_key", "ElevenLabs API key")?
-    {
+    if let Some(key) = read_credential(
+        "ATLAS2_STT_API_KEY_FILE",
+        "stt_api_key",
+        "ElevenLabs API key",
+    )? {
         return Ok(key);
     }
 

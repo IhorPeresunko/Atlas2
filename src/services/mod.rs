@@ -1,27 +1,22 @@
 use std::{collections::HashMap, sync::Arc};
 
 use chrono::Utc;
-use tokio::sync::{
-    Mutex, OwnedMutexGuard,
-    mpsc::unbounded_channel,
-};
+use tokio::sync::{Mutex, OwnedMutexGuard, mpsc::unbounded_channel};
 
 use crate::{
     codex::{CodexApi, CodexClient, CodexEvent},
     config::Config,
     domain::{
-        ApprovalId, ApprovalStatus, FolderBrowseState, HistoricProject, PendingApproval,
-        PendingPlanFollowUp, PendingUserInput, PlanFollowUpId, PlanFollowUpStatus, PromptMode,
-        SessionBackend, SessionId, SessionRecord, SessionStatus, TelegramChatId, TelegramUserId,
-        UserInputAnswer, UserInputRequestId, UserInputStatus, WorkspacePath,
+        ApprovalStatus, PendingApproval, PendingPlanFollowUp, PendingUserInput, PlanFollowUpId,
+        PlanFollowUpStatus, PromptMode, SessionBackend, SessionId, SessionRecord, SessionStatus,
+        TelegramChatId, TelegramUserId, UserInputStatus,
     },
     error::{AppError, AppResult},
     filesystem::FilesystemService,
     presentation::{
         TelegramMessage, TelegramTurnDeliveryState, TelegramTurnUpdate, TurnTerminalState,
-        historic_projects_markup, plan_follow_up_markup, render_command_finished_message,
-        render_historic_projects_prompt, render_turn_terminal_text, render_user_input_prompt,
-        render_user_input_summary, render_voice_transcript_message, send_clear_status_update,
+        plan_follow_up_markup, render_command_finished_message, render_turn_terminal_text,
+        render_user_input_prompt, render_voice_transcript_message, send_clear_status_update,
         send_command_finished_update, send_status_update, send_telegram_update, send_text_update,
         turn_control_markup, user_input_markup,
     },
@@ -30,7 +25,34 @@ use crate::{
     telegram::{InlineKeyboardMarkup, TelegramApi, TelegramClient, button},
 };
 
-const HISTORIC_PROJECT_LIMIT: usize = 8;
+mod approval;
+mod folder;
+mod model;
+mod plan;
+mod user_input;
+
+pub use approval::ApprovalService;
+pub use folder::{FolderCallbackResult, FolderService};
+pub use model::{ModelCallbackResult, ModelService};
+pub(crate) use plan::build_plan_implementation_prompt;
+pub use plan::{PlanFollowUpCallbackResult, PlanService};
+pub use user_input::{UserInputCallbackResult, UserInputService, UserInputTextResult};
+
+/// Shared authorization helper: a chat action is allowed only for Telegram group
+/// admins. Used by `AppServices` and the extracted sub-services.
+pub(crate) async fn require_group_admin<Tg: TelegramApi>(
+    telegram: &Tg,
+    chat_id: TelegramChatId,
+    user_id: TelegramUserId,
+) -> AppResult<()> {
+    let member = telegram.get_chat_member(chat_id, user_id).await?;
+    if !member.is_admin() {
+        return Err(AppError::Validation(
+            "only Telegram group admins can perform this action".into(),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 struct LiveTurnControl {
@@ -44,11 +66,15 @@ pub struct AppServices<Cx: CodexApi = CodexClient, Tg: TelegramApi = TelegramCli
     pub config: Config,
     pub storage: Storage,
     pub telegram: Tg,
-    pub filesystem: FilesystemService,
     pub codex: Cx,
     pub stt: SttClient,
     session_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
     live_turns: Arc<Mutex<HashMap<SessionId, LiveTurnControl>>>,
+    pub folder: FolderService<Cx, Tg>,
+    pub model: ModelService<Cx>,
+    pub approvals: ApprovalService<Cx, Tg>,
+    pub user_input: UserInputService<Cx, Tg>,
+    pub plans: PlanService<Tg>,
 }
 
 impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> AppServices<Cx, Tg> {
@@ -60,38 +86,31 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> AppServices<Cx, Tg> {
         codex: Cx,
         stt: SttClient,
     ) -> Self {
+        let model = ModelService::new(storage.clone(), codex.clone());
+        let folder = FolderService::new(
+            storage.clone(),
+            telegram.clone(),
+            filesystem.clone(),
+            config.clone(),
+            model.clone(),
+        );
+        let approvals = ApprovalService::new(storage.clone(), telegram.clone(), codex.clone());
+        let user_input = UserInputService::new(storage.clone(), telegram.clone(), codex.clone());
+        let plans = PlanService::new(storage.clone(), telegram.clone());
         Self {
             config,
             storage,
             telegram,
-            filesystem,
             codex,
             stt,
             session_locks: Arc::new(Mutex::new(HashMap::new())),
             live_turns: Arc::new(Mutex::new(HashMap::new())),
+            folder,
+            model,
+            approvals,
+            user_input,
+            plans,
         }
-    }
-
-    pub async fn begin_new_session(
-        &self,
-        chat_id: TelegramChatId,
-    ) -> AppResult<(String, InlineKeyboardMarkup)> {
-        let historic = self
-            .storage
-            .list_historic_projects_for_chat(chat_id, HISTORIC_PROJECT_LIMIT)
-            .await?;
-        let historic = self.filter_existing_historic_projects(historic).await;
-
-        if historic.is_empty() {
-            let text = self.begin_folder_selection(chat_id).await?;
-            let markup = self.folder_markup("/").await?;
-            return Ok((text, markup));
-        }
-
-        Ok((
-            render_historic_projects_prompt(),
-            historic_projects_markup(&historic),
-        ))
     }
 
     pub async fn register_chat(
@@ -108,439 +127,7 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> AppServices<Cx, Tg> {
         chat_id: TelegramChatId,
         user_id: TelegramUserId,
     ) -> AppResult<()> {
-        let member = self.telegram.get_chat_member(chat_id, user_id).await?;
-        if !member.is_admin() {
-            return Err(AppError::Validation(
-                "only Telegram group admins can perform this action".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    pub async fn begin_folder_selection(&self, chat_id: TelegramChatId) -> AppResult<String> {
-        let state = FolderBrowseState {
-            chat_id,
-            current_path: WorkspacePath("/".into()),
-        };
-        self.storage.set_folder_browse_state(&state).await?;
-        self.render_folder_prompt(chat_id, &state.current_path.0)
-            .await
-    }
-
-    pub async fn handle_folder_callback(
-        &self,
-        chat_id: TelegramChatId,
-        user_id: TelegramUserId,
-        payload: &str,
-    ) -> AppResult<FolderCallbackResult> {
-        self.require_group_admin(chat_id, user_id).await?;
-        self.handle_folder_callback_authorized(chat_id, payload)
-            .await
-    }
-
-    async fn handle_folder_callback_authorized(
-        &self,
-        chat_id: TelegramChatId,
-        payload: &str,
-    ) -> AppResult<FolderCallbackResult> {
-        let mut parts = payload.splitn(3, ':');
-        let action = parts.next().unwrap_or_default();
-        let raw_value = parts.next().unwrap_or_default();
-
-        match action {
-            "project-history-select" => {
-                let source_session_id =
-                    SessionId(uuid::Uuid::parse_str(raw_value).map_err(|error| {
-                        AppError::Validation(format!(
-                            "invalid historic project session ID in callback: {error}"
-                        ))
-                    })?);
-                let source_workspace = self
-                    .storage
-                    .get_session_workspace_for_chat(chat_id, &source_session_id)
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::Validation("historic project no longer exists".into())
-                    })?;
-                let workspace = self
-                    .filesystem
-                    .normalize_directory(&source_workspace.0)
-                    .await?;
-                let text = self.start_new_session(chat_id, workspace).await?;
-                Ok(FolderCallbackResult::Replace(text))
-            }
-            "project-add-new" => {
-                let text = self.begin_folder_selection(chat_id).await?;
-                Ok(FolderCallbackResult::Render(
-                    text,
-                    self.folder_markup("/").await?,
-                ))
-            }
-            "folder-open" => {
-                let state = self
-                    .storage
-                    .get_folder_browse_state(chat_id)
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::Validation("no active folder selection for this group".into())
-                    })?;
-                let target = self
-                    .resolve_folder_entry(&state.current_path.0, raw_value)
-                    .await?;
-                let normalized = self.filesystem.normalize_directory(&target.0).await?;
-                let new_state = FolderBrowseState {
-                    chat_id,
-                    current_path: normalized.clone(),
-                };
-                self.storage.set_folder_browse_state(&new_state).await?;
-                let text = self.render_folder_prompt(chat_id, &normalized.0).await?;
-                Ok(FolderCallbackResult::Render(
-                    text,
-                    self.folder_markup(&normalized.0).await?,
-                ))
-            }
-            "folder-up" => {
-                let state = self
-                    .storage
-                    .get_folder_browse_state(chat_id)
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::Validation("no active folder selection for this group".into())
-                    })?;
-                let parent = self
-                    .filesystem
-                    .parent_directory(&state.current_path.0)
-                    .unwrap_or(WorkspacePath("/".into()));
-                let normalized = self.filesystem.normalize_directory(&parent.0).await?;
-                let new_state = FolderBrowseState {
-                    chat_id,
-                    current_path: normalized.clone(),
-                };
-                self.storage.set_folder_browse_state(&new_state).await?;
-                let text = self.render_folder_prompt(chat_id, &normalized.0).await?;
-                Ok(FolderCallbackResult::Render(
-                    text,
-                    self.folder_markup(&normalized.0).await?,
-                ))
-            }
-            "folder-select" => {
-                let state = self
-                    .storage
-                    .get_folder_browse_state(chat_id)
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::Validation("no active folder selection for this group".into())
-                    })?;
-                let workspace = self
-                    .filesystem
-                    .normalize_directory(&state.current_path.0)
-                    .await?;
-                self.storage.clear_folder_browse_state(chat_id).await?;
-                let text = self.start_new_session(chat_id, workspace).await?;
-                Ok(FolderCallbackResult::Replace(text))
-            }
-            "folder-cancel" => {
-                self.storage.clear_folder_browse_state(chat_id).await?;
-                Ok(FolderCallbackResult::Replace(
-                    "Cancelled folder selection.".into(),
-                ))
-            }
-            _ => Err(AppError::Validation("unknown folder action".into())),
-        }
-    }
-
-    async fn filter_existing_historic_projects(
-        &self,
-        projects: Vec<HistoricProject>,
-    ) -> Vec<HistoricProject> {
-        let mut existing = Vec::new();
-        for project in projects {
-            if self
-                .filesystem
-                .normalize_directory(&project.workspace_path.0)
-                .await
-                .is_ok()
-            {
-                existing.push(project);
-            }
-        }
-        existing
-    }
-
-    async fn start_new_session(
-        &self,
-        chat_id: TelegramChatId,
-        workspace: WorkspacePath,
-    ) -> AppResult<String> {
-        let now = Utc::now();
-        let session = SessionRecord {
-            session_id: SessionId::new(),
-            chat_id,
-            workspace_path: workspace.clone(),
-            backend: SessionBackend::AppServer,
-            provider_thread_id: None,
-            resume_cursor_json: None,
-            status: SessionStatus::Ready,
-            last_error: None,
-            created_at: now,
-            updated_at: now,
-        };
-        self.storage.insert_session(&session).await?;
-        self.storage
-            .set_active_session(chat_id, Some(&session.session_id))
-            .await?;
-        let model_note = match self.ensure_chat_model(chat_id, &workspace.0).await {
-            Ok(Some(model)) => format!("\nModel: {model}."),
-            Ok(None) => String::new(),
-            Err(error) => {
-                tracing::warn!(chat_id = chat_id.0, error = %error, "could not resolve default model for new session");
-                String::new()
-            }
-        };
-        Ok(format!(
-            "Started new session in `{}`.{model_note}\nSend a prompt to start working.",
-            workspace.0
-        ))
-    }
-
-    async fn render_folder_prompt(
-        &self,
-        _chat_id: TelegramChatId,
-        path: &str,
-    ) -> AppResult<String> {
-        let entries = self
-            .filesystem
-            .list_directory(path, self.config.max_directory_entries)
-            .await?;
-        let mut body = format!("Select a workspace folder.\nCurrent path: `{path}`");
-        if entries.is_empty() {
-            body.push_str("\n\nNo entries found here.");
-        }
-        Ok(body)
-    }
-
-    pub async fn folder_markup(&self, path: &str) -> AppResult<InlineKeyboardMarkup> {
-        let entries = self
-            .filesystem
-            .list_directory(path, self.config.max_directory_entries)
-            .await?;
-
-        let mut buttons = Vec::new();
-        buttons.push(button("Select this folder", "folder-select:current"));
-        if path != "/" {
-            buttons.push(button("Up", "folder-up:current"));
-        }
-        for (index, entry) in entries.into_iter().filter(|entry| entry.is_dir).enumerate() {
-            buttons.push(button(
-                format!("Open {}", entry.name),
-                format!("folder-open:{index}"),
-            ));
-        }
-        buttons.push(button("Cancel", "folder-cancel:current"));
-        Ok(InlineKeyboardMarkup::single_column(buttons))
-    }
-
-    /// Resolve the workspace whose Codex catalog should back the model picker:
-    /// the active session's directory, or the current directory when none.
-    async fn chat_workspace(&self, chat_id: TelegramChatId) -> AppResult<String> {
-        Ok(self
-            .storage
-            .get_active_session_for_chat(chat_id)
-            .await?
-            .map(|session| session.workspace_path.0)
-            .unwrap_or_else(|| ".".to_string()))
-    }
-
-    /// Build the `/model` picker (step 1): the current selection plus the model
-    /// catalog reported by Codex core, rendered as tap-to-select buttons.
-    pub async fn model_menu(
-        &self,
-        chat_id: TelegramChatId,
-    ) -> AppResult<(String, Option<InlineKeyboardMarkup>)> {
-        let chat = self.storage.get_chat(chat_id).await?;
-        let current = chat.as_ref().and_then(|chat| chat.model.clone());
-        let current_effort = chat.as_ref().and_then(|chat| chat.reasoning_effort.clone());
-
-        let workspace = self.chat_workspace(chat_id).await?;
-        let models = self.codex.list_models(&workspace).await?;
-
-        let model_label = current.as_deref().unwrap_or("Codex default");
-        let effort_label = current_effort.as_deref().unwrap_or("model default");
-        let mut text = format!("Current model: {model_label}\nThinking level: {effort_label}\n");
-        if models.is_empty() {
-            text.push_str("\nCodex reported no models. Set one with /model <name>.");
-            return Ok((text, None));
-        }
-        text.push_str("\nPick a model:");
-
-        let mut buttons = Vec::new();
-        for model in &models {
-            let selected = current.as_deref() == Some(model.model.as_str());
-            let mut label = model.display_name.clone();
-            if model.is_default {
-                label.push_str(" (default)");
-            }
-            if selected {
-                label = format!("✓ {label}");
-            }
-            buttons.push(button(label, format!("model-set:{}", model.model)));
-        }
-        Ok((text, Some(InlineKeyboardMarkup::single_column(buttons))))
-    }
-
-    /// Persist a model picked from the step-1 buttons, then either advance to
-    /// the reasoning-level step (step 2) when the model supports it, or finalize.
-    pub async fn select_chat_model(
-        &self,
-        chat_id: TelegramChatId,
-        model: &str,
-    ) -> AppResult<ModelCallbackResult> {
-        // Persisting the model also clears any prior effort (it is model-specific).
-        self.storage.set_chat_model(chat_id, Some(model)).await?;
-
-        let workspace = self.chat_workspace(chat_id).await?;
-        let chosen = self
-            .codex
-            .list_models(&workspace)
-            .await?
-            .into_iter()
-            .find(|entry| entry.model == model);
-
-        let Some(chosen) = chosen else {
-            // Model not in the catalog (e.g. stale list); keep it as-is.
-            return Ok(ModelCallbackResult::Replace(format!(
-                "Model set to {model}. It applies to the next turn."
-            )));
-        };
-
-        if chosen.supported_reasoning_efforts.is_empty() {
-            return Ok(ModelCallbackResult::Replace(format!(
-                "Model set to {model}. It applies to the next turn."
-            )));
-        }
-
-        // Seed the model's default effort so a sensible value is stored even if
-        // the user dismisses step 2 without choosing.
-        if let Some(default_effort) = chosen.default_reasoning_effort.as_deref() {
-            self.storage
-                .set_chat_reasoning_effort(chat_id, Some(default_effort))
-                .await?;
-        }
-
-        let text = format!(
-            "Model set to {model}.\nNow pick a thinking level:"
-        );
-        let mut buttons = Vec::new();
-        for effort in &chosen.supported_reasoning_efforts {
-            let is_default = chosen.default_reasoning_effort.as_deref() == Some(effort.effort.as_str());
-            let mut label = if effort.description.is_empty() {
-                effort.effort.clone()
-            } else {
-                format!("{} — {}", effort.effort, effort.description)
-            };
-            if is_default {
-                label.push_str(" (default)");
-            }
-            buttons.push(button(label, format!("model-effort:{}", effort.effort)));
-        }
-        Ok(ModelCallbackResult::Render(
-            text,
-            InlineKeyboardMarkup::single_column(buttons),
-        ))
-    }
-
-    /// Persist a reasoning level picked from the step-2 buttons and finalize.
-    pub async fn select_chat_reasoning_effort(
-        &self,
-        chat_id: TelegramChatId,
-        effort: &str,
-    ) -> AppResult<String> {
-        self.storage
-            .set_chat_reasoning_effort(chat_id, Some(effort))
-            .await?;
-        let model = self
-            .storage
-            .get_chat(chat_id)
-            .await?
-            .and_then(|chat| chat.model)
-            .unwrap_or_else(|| "Codex default".to_string());
-        Ok(format!(
-            "Model {model}, thinking level {effort}. It applies to the next turn."
-        ))
-    }
-
-    /// Persist a model set directly via `/model <name>`. The reasoning level is
-    /// left at the model's default (cleared); use /model buttons to tune it.
-    pub async fn set_chat_model_by_name(
-        &self,
-        chat_id: TelegramChatId,
-        model: &str,
-    ) -> AppResult<String> {
-        let model = model.trim();
-        if model.is_empty() {
-            return Err(AppError::Validation("model name cannot be empty".into()));
-        }
-        self.storage.set_chat_model(chat_id, Some(model)).await?;
-        Ok(format!(
-            "Model set to {model}. Use /model to also pick a thinking level. It applies to the next turn."
-        ))
-    }
-
-    /// Returns Codex's default model for a workspace (the entry it flags as
-    /// default, otherwise the first one), or None if Codex reports no models.
-    async fn resolve_default_model(&self, workspace: &str) -> AppResult<Option<String>> {
-        let models = self.codex.list_models(workspace).await?;
-        Ok(models
-            .iter()
-            .find(|entry| entry.is_default)
-            .or_else(|| models.first())
-            .map(|entry| entry.model.clone()))
-    }
-
-    /// Ensures the chat has a model selected, defaulting to Codex's default for
-    /// the workspace when none is set. The Codex app-server requires a model on
-    /// every turn, so a chat must never reach a turn without one. Returns the
-    /// effective model name when known.
-    async fn ensure_chat_model(
-        &self,
-        chat_id: TelegramChatId,
-        workspace: &str,
-    ) -> AppResult<Option<String>> {
-        if let Some(model) = self
-            .storage
-            .get_chat(chat_id)
-            .await?
-            .and_then(|chat| chat.model)
-        {
-            return Ok(Some(model));
-        }
-        let Some(default_model) = self.resolve_default_model(workspace).await? else {
-            return Ok(None);
-        };
-        self.storage
-            .set_chat_model(chat_id, Some(&default_model))
-            .await?;
-        Ok(Some(default_model))
-    }
-
-    async fn resolve_folder_entry(
-        &self,
-        current_path: &str,
-        raw_index: &str,
-    ) -> AppResult<WorkspacePath> {
-        let index = raw_index
-            .parse::<usize>()
-            .map_err(|_| AppError::Validation("invalid folder entry selection".into()))?;
-        let entries = self
-            .filesystem
-            .list_directory(current_path, self.config.max_directory_entries)
-            .await?;
-        let entry = entries
-            .into_iter()
-            .filter(|entry| entry.is_dir)
-            .nth(index)
-            .ok_or_else(|| AppError::Validation("folder entry no longer exists".into()))?;
-        Ok(entry.path)
+        require_group_admin(&self.telegram, chat_id, user_id).await
     }
 
     pub async fn render_sessions(&self) -> AppResult<String> {
@@ -569,256 +156,6 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> AppServices<Cx, Tg> {
             ));
         }
         Ok(lines.join("\n"))
-    }
-
-    pub async fn resolve_approval(
-        &self,
-        approval_id: ApprovalId,
-        chat_id: TelegramChatId,
-        user_id: TelegramUserId,
-        approved: bool,
-    ) -> AppResult<String> {
-        self.require_group_admin(chat_id, user_id).await?;
-
-        let approval = self
-            .storage
-            .get_pending_approval(&approval_id)
-            .await?
-            .ok_or_else(|| AppError::Validation("approval request not found".into()))?;
-
-        if approval.chat_id != chat_id {
-            return Err(AppError::Validation(
-                "approval request belongs to a different chat".into(),
-            ));
-        }
-        if approval.status != ApprovalStatus::Pending {
-            let message = if approval.status == ApprovalStatus::Expired {
-                "approval request is no longer active"
-            } else {
-                "approval request has already been resolved"
-            };
-            return Err(AppError::Validation(message.into()));
-        }
-
-        let new_status = if approved {
-            ApprovalStatus::Approved
-        } else {
-            ApprovalStatus::Rejected
-        };
-        self.codex
-            .resolve_approval(&approval.session_id, &approval_id, approved)
-            .await?;
-        self.storage
-            .resolve_approval(&approval_id, new_status.clone(), user_id)
-            .await?;
-        self.storage
-            .update_session_status(&approval.session_id, SessionStatus::Running, None)
-            .await?;
-
-        Ok(match new_status {
-            ApprovalStatus::Approved => "Approval sent to Codex.".into(),
-            ApprovalStatus::Rejected => "Rejection sent to Codex.".into(),
-            ApprovalStatus::Pending => unreachable!(),
-            ApprovalStatus::Expired => unreachable!(),
-        })
-    }
-
-    pub async fn resolve_user_input_choice(
-        &self,
-        request_id: UserInputRequestId,
-        chat_id: TelegramChatId,
-        user_id: TelegramUserId,
-        question_index: usize,
-        option_index: usize,
-    ) -> AppResult<UserInputCallbackResult> {
-        self.require_group_admin(chat_id, user_id).await?;
-
-        let request = self
-            .storage
-            .get_pending_user_input(&request_id)
-            .await?
-            .ok_or_else(|| AppError::Validation("user input request not found".into()))?;
-
-        if request.chat_id != chat_id {
-            return Err(AppError::Validation(
-                "user input request belongs to a different chat".into(),
-            ));
-        }
-        if request.status != UserInputStatus::Pending {
-            let message = if request.status == UserInputStatus::Expired {
-                "user input request is no longer active"
-            } else {
-                "user input request has already been answered"
-            };
-            return Err(AppError::Validation(message.into()));
-        }
-
-        let answered_count = request.answers.len();
-        if question_index != answered_count {
-            return Err(AppError::Validation(
-                "this question is no longer awaiting an answer".into(),
-            ));
-        }
-
-        let question = request
-            .questions
-            .get(question_index)
-            .ok_or_else(|| AppError::Validation("invalid question index".into()))?;
-        let option = question
-            .options
-            .as_ref()
-            .and_then(|options| options.get(option_index))
-            .ok_or_else(|| AppError::Validation("invalid option index".into()))?;
-        let answer = option.label.clone();
-
-        match self
-            .apply_user_input_answer(request, user_id, answer)
-            .await?
-        {
-            UserInputAdvance::NextQuestion { text, markup } => {
-                Ok(UserInputCallbackResult::Render(text, markup))
-            }
-            UserInputAdvance::Completed { summary } => {
-                Ok(UserInputCallbackResult::Replace(summary))
-            }
-        }
-    }
-
-    pub async fn consume_user_input_text(
-        &self,
-        chat_id: TelegramChatId,
-        user_id: TelegramUserId,
-        text: &str,
-    ) -> AppResult<Option<UserInputTextResult>> {
-        self.require_group_admin(chat_id, user_id).await?;
-
-        let request = match self
-            .storage
-            .get_pending_user_input_for_chat(chat_id)
-            .await?
-        {
-            Some(request) => request,
-            None => return Ok(None),
-        };
-
-        if request.status != UserInputStatus::Pending {
-            return Ok(None);
-        }
-
-        let answer = text.trim();
-        if answer.is_empty() {
-            return Ok(None);
-        }
-
-        let result = self
-            .apply_user_input_answer(request, user_id, answer.to_string())
-            .await?;
-        Ok(Some(match result {
-            UserInputAdvance::NextQuestion { text, markup } => {
-                UserInputTextResult::Render(text, markup)
-            }
-            UserInputAdvance::Completed { summary } => UserInputTextResult::Replace(summary),
-        }))
-    }
-
-    pub async fn resolve_plan_follow_up_implement(
-        &self,
-        follow_up_id: PlanFollowUpId,
-        chat_id: TelegramChatId,
-        user_id: TelegramUserId,
-    ) -> AppResult<PlanFollowUpCallbackResult> {
-        self.require_group_admin(chat_id, user_id).await?;
-
-        let follow_up = self
-            .storage
-            .get_pending_plan_follow_up(&follow_up_id)
-            .await?
-            .ok_or_else(|| AppError::Validation("plan follow-up not found".into()))?;
-
-        if follow_up.chat_id != chat_id {
-            return Err(AppError::Validation(
-                "plan follow-up belongs to a different chat".into(),
-            ));
-        }
-        if follow_up.status != PlanFollowUpStatus::Pending {
-            return Err(AppError::Validation(
-                "plan follow-up is no longer active".into(),
-            ));
-        }
-
-        self.storage
-            .resolve_pending_plan_follow_up(
-                &follow_up_id,
-                PlanFollowUpStatus::Implemented,
-                Some(user_id),
-            )
-            .await?;
-
-        Ok(PlanFollowUpCallbackResult::Implement {
-            text: "Starting plan implementation.".into(),
-            prompt: build_plan_implementation_prompt(&follow_up.plan_markdown),
-        })
-    }
-
-    pub async fn resolve_plan_follow_up_refine(
-        &self,
-        follow_up_id: PlanFollowUpId,
-        chat_id: TelegramChatId,
-        user_id: TelegramUserId,
-    ) -> AppResult<PlanFollowUpCallbackResult> {
-        self.require_group_admin(chat_id, user_id).await?;
-
-        let follow_up = self
-            .storage
-            .get_pending_plan_follow_up(&follow_up_id)
-            .await?
-            .ok_or_else(|| AppError::Validation("plan follow-up not found".into()))?;
-
-        if follow_up.chat_id != chat_id {
-            return Err(AppError::Validation(
-                "plan follow-up belongs to a different chat".into(),
-            ));
-        }
-        if follow_up.status != PlanFollowUpStatus::Pending {
-            return Err(AppError::Validation(
-                "plan follow-up is no longer active".into(),
-            ));
-        }
-
-        self.storage
-            .resolve_pending_plan_follow_up(
-                &follow_up_id,
-                PlanFollowUpStatus::AwaitingRefinement,
-                Some(user_id),
-            )
-            .await?;
-
-        Ok(PlanFollowUpCallbackResult::Replace(
-            "Send your next message with feedback to refine the plan.".into(),
-        ))
-    }
-
-    pub async fn consume_plan_refinement(
-        &self,
-        chat_id: TelegramChatId,
-        text: &str,
-    ) -> AppResult<Option<String>> {
-        let Some(follow_up) = self
-            .storage
-            .get_awaiting_plan_follow_up_for_chat(chat_id)
-            .await?
-        else {
-            return Ok(None);
-        };
-
-        self.storage
-            .resolve_pending_plan_follow_up(
-                &follow_up.follow_up_id,
-                PlanFollowUpStatus::Refined,
-                None,
-            )
-            .await?;
-        Ok(Some(text.to_string()))
     }
 
     pub async fn run_prompt(&self, chat_id: TelegramChatId, prompt: &str) -> AppResult<()> {
@@ -940,6 +277,7 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> AppServices<Cx, Tg> {
         // persist its default when the chat has none (e.g. a brand-new chat).
         if model.is_none() {
             model = self
+                .model
                 .ensure_chat_model(chat_id, &session.workspace_path.0)
                 .await?;
         }
@@ -1306,103 +644,6 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> AppServices<Cx, Tg> {
     }
 }
 
-enum UserInputAdvance {
-    NextQuestion {
-        text: String,
-        markup: InlineKeyboardMarkup,
-    },
-    Completed {
-        summary: String,
-    },
-}
-
-impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> AppServices<Cx, Tg> {
-    async fn apply_user_input_answer(
-        &self,
-        mut request: PendingUserInput,
-        user_id: TelegramUserId,
-        answer: String,
-    ) -> AppResult<UserInputAdvance> {
-        let question_index = request.answers.len();
-        let question = request
-            .questions
-            .get(question_index)
-            .ok_or_else(|| AppError::Validation("no pending question remains".into()))?;
-
-        request.answers.insert(
-            question.id.clone(),
-            UserInputAnswer {
-                answers: vec![answer],
-            },
-        );
-        let answers_json = serde_json::to_string(&request.answers)?;
-
-        if request.answers.len() < request.questions.len() {
-            self.storage
-                .update_pending_user_input_answers(&request.request_id, &answers_json)
-                .await?;
-            return Ok(UserInputAdvance::NextQuestion {
-                text: render_user_input_prompt(&request),
-                markup: user_input_markup(&request)?,
-            });
-        }
-
-        self.codex
-            .resolve_user_input(
-                &request.session_id,
-                &request.request_id,
-                request.answers.clone(),
-            )
-            .await?;
-        self.storage
-            .resolve_pending_user_input(
-                &request.request_id,
-                UserInputStatus::Answered,
-                user_id,
-                &answers_json,
-            )
-            .await?;
-        self.storage
-            .update_session_status(&request.session_id, SessionStatus::Running, None)
-            .await?;
-
-        Ok(UserInputAdvance::Completed {
-            summary: render_user_input_summary(&request),
-        })
-    }
-}
-
-pub enum FolderCallbackResult {
-    Render(String, InlineKeyboardMarkup),
-    Replace(String),
-}
-
-pub enum ModelCallbackResult {
-    /// Advance to the reasoning-level step (step 2) with new buttons.
-    Render(String, InlineKeyboardMarkup),
-    /// Finalize the selection, replacing the message with a confirmation.
-    Replace(String),
-}
-
-pub enum UserInputCallbackResult {
-    Render(String, InlineKeyboardMarkup),
-    Replace(String),
-}
-
-pub enum UserInputTextResult {
-    Render(String, InlineKeyboardMarkup),
-    Replace(String),
-}
-
-pub enum PlanFollowUpCallbackResult {
-    Replace(String),
-    Implement { text: String, prompt: String },
-}
-
-fn build_plan_implementation_prompt(plan_markdown: &str) -> String {
-    format!("PLEASE IMPLEMENT THIS PLAN:\n{}", plan_markdown.trim())
-}
-
 #[cfg(test)]
 mod tests {
     use crate::codex::CodexClient;
@@ -1763,7 +1004,7 @@ mod tests {
             SttClient::Disabled,
         );
 
-        let (text, markup) = services.begin_new_session(chat_id).await.unwrap();
+        let (text, markup) = services.folder.begin_new_session(chat_id).await.unwrap();
 
         assert_eq!(text, "Select a project or add a new one.");
         assert_eq!(
@@ -1997,7 +1238,8 @@ mod tests {
         let (services, codex) = services_with_fakes(true).await;
         let session = seed_session(chat_id);
         services.storage.insert_session(&session).await.unwrap();
-        let approval = pending_approval(session.session_id.clone(), chat_id, ApprovalStatus::Pending);
+        let approval =
+            pending_approval(session.session_id.clone(), chat_id, ApprovalStatus::Pending);
         services
             .storage
             .insert_pending_approval(&approval)
@@ -2005,7 +1247,13 @@ mod tests {
             .unwrap();
 
         let message = services
-            .resolve_approval(approval.approval_id.clone(), chat_id, TelegramUserId(1), true)
+            .approvals
+            .resolve_approval(
+                approval.approval_id.clone(),
+                chat_id,
+                TelegramUserId(1),
+                true,
+            )
             .await
             .unwrap();
 
@@ -2029,7 +1277,8 @@ mod tests {
         let (services, codex) = services_with_fakes(true).await;
         let session = seed_session(chat_id);
         services.storage.insert_session(&session).await.unwrap();
-        let approval = pending_approval(session.session_id.clone(), chat_id, ApprovalStatus::Pending);
+        let approval =
+            pending_approval(session.session_id.clone(), chat_id, ApprovalStatus::Pending);
         services
             .storage
             .insert_pending_approval(&approval)
@@ -2037,7 +1286,13 @@ mod tests {
             .unwrap();
 
         let message = services
-            .resolve_approval(approval.approval_id.clone(), chat_id, TelegramUserId(1), false)
+            .approvals
+            .resolve_approval(
+                approval.approval_id.clone(),
+                chat_id,
+                TelegramUserId(1),
+                false,
+            )
             .await
             .unwrap();
 
@@ -2058,7 +1313,8 @@ mod tests {
         let (services, codex) = services_with_fakes(false).await;
         let session = seed_session(chat_id);
         services.storage.insert_session(&session).await.unwrap();
-        let approval = pending_approval(session.session_id.clone(), chat_id, ApprovalStatus::Pending);
+        let approval =
+            pending_approval(session.session_id.clone(), chat_id, ApprovalStatus::Pending);
         services
             .storage
             .insert_pending_approval(&approval)
@@ -2066,7 +1322,13 @@ mod tests {
             .unwrap();
 
         let result = services
-            .resolve_approval(approval.approval_id.clone(), chat_id, TelegramUserId(1), true)
+            .approvals
+            .resolve_approval(
+                approval.approval_id.clone(),
+                chat_id,
+                TelegramUserId(1),
+                true,
+            )
             .await;
 
         assert!(matches!(result, Err(AppError::Validation(_))));
@@ -2080,7 +1342,8 @@ mod tests {
         let (services, codex) = services_with_fakes(true).await;
         let session = seed_session(chat_id);
         services.storage.insert_session(&session).await.unwrap();
-        let approval = pending_approval(session.session_id.clone(), chat_id, ApprovalStatus::Pending);
+        let approval =
+            pending_approval(session.session_id.clone(), chat_id, ApprovalStatus::Pending);
         services
             .storage
             .insert_pending_approval(&approval)
@@ -2088,6 +1351,7 @@ mod tests {
             .unwrap();
 
         let result = services
+            .approvals
             .resolve_approval(
                 approval.approval_id.clone(),
                 TelegramChatId(999),
@@ -2106,8 +1370,11 @@ mod tests {
         let (services, codex) = services_with_fakes(true).await;
         let session = seed_session(chat_id);
         services.storage.insert_session(&session).await.unwrap();
-        let approval =
-            pending_approval(session.session_id.clone(), chat_id, ApprovalStatus::Approved);
+        let approval = pending_approval(
+            session.session_id.clone(),
+            chat_id,
+            ApprovalStatus::Approved,
+        );
         services
             .storage
             .insert_pending_approval(&approval)
@@ -2115,7 +1382,13 @@ mod tests {
             .unwrap();
 
         let result = services
-            .resolve_approval(approval.approval_id.clone(), chat_id, TelegramUserId(1), true)
+            .approvals
+            .resolve_approval(
+                approval.approval_id.clone(),
+                chat_id,
+                TelegramUserId(1),
+                true,
+            )
             .await;
 
         assert!(matches!(result, Err(AppError::Validation(_))));
@@ -2136,13 +1409,8 @@ mod tests {
             .unwrap();
 
         let result = services
-            .resolve_user_input_choice(
-                request.request_id.clone(),
-                chat_id,
-                TelegramUserId(1),
-                0,
-                0,
-            )
+            .user_input
+            .resolve_user_input_choice(request.request_id.clone(), chat_id, TelegramUserId(1), 0, 0)
             .await
             .unwrap();
 
@@ -2165,13 +1433,8 @@ mod tests {
             .unwrap();
 
         let result = services
-            .resolve_user_input_choice(
-                request.request_id.clone(),
-                chat_id,
-                TelegramUserId(1),
-                0,
-                0,
-            )
+            .user_input
+            .resolve_user_input_choice(request.request_id.clone(), chat_id, TelegramUserId(1), 0, 0)
             .await
             .unwrap();
 
@@ -2196,13 +1459,8 @@ mod tests {
 
         // Answering question index 1 while index 0 is still pending must be rejected.
         let result = services
-            .resolve_user_input_choice(
-                request.request_id.clone(),
-                chat_id,
-                TelegramUserId(1),
-                1,
-                0,
-            )
+            .user_input
+            .resolve_user_input_choice(request.request_id.clone(), chat_id, TelegramUserId(1), 1, 0)
             .await;
 
         assert!(matches!(result, Err(AppError::Validation(_))));

@@ -88,6 +88,7 @@ impl App {
                 if !text.starts_with('/') {
                     if let Some(result) = self
                         .services
+                        .user_input
                         .consume_user_input_text(chat_id, user_id, &text)
                         .await?
                     {
@@ -115,6 +116,7 @@ impl App {
                     }
                     if let Some(prompt) = self
                         .services
+                        .plans
                         .consume_plan_refinement(chat_id, &text)
                         .await?
                     {
@@ -171,7 +173,8 @@ impl App {
                     }
                     IncomingMessage::NewSession => {
                         self.services.require_group_admin(chat_id, user_id).await?;
-                        let (text, markup) = self.services.begin_new_session(chat_id).await?;
+                        let (text, markup) =
+                            self.services.folder.begin_new_session(chat_id).await?;
                         self.services
                             .telegram
                             .send_message(chat_id, &text, None, Some(markup))
@@ -216,7 +219,7 @@ impl App {
                     IncomingMessage::ModelMenu => {
                         let services = self.services.clone();
                         tokio::spawn(async move {
-                            match services.model_menu(chat_id).await {
+                            match services.model.model_menu(chat_id).await {
                                 Ok((text, markup)) => {
                                     let _ = services
                                         .telegram
@@ -243,7 +246,11 @@ impl App {
                         });
                     }
                     IncomingMessage::SetModel(model) => {
-                        let text = self.services.set_chat_model_by_name(chat_id, model).await?;
+                        let text = self
+                            .services
+                            .model
+                            .set_chat_model_by_name(chat_id, model)
+                            .await?;
                         self.services
                             .telegram
                             .send_message(chat_id, &text, None, None)
@@ -339,6 +346,7 @@ impl App {
                     AppError::Validation(format!("invalid approval ID in callback: {error}"))
                 })?);
                 self.services
+                    .approvals
                     .resolve_approval(approval_id, chat_id, user_id, true)
                     .await
             } else if let Some(id) = data.strip_prefix("approval-reject:") {
@@ -346,6 +354,7 @@ impl App {
                     AppError::Validation(format!("invalid approval ID in callback: {error}"))
                 })?);
                 self.services
+                    .approvals
                     .resolve_approval(approval_id, chat_id, user_id, false)
                     .await
             } else if let Some(id) = data.strip_prefix("turn-stop:") {
@@ -389,6 +398,7 @@ impl App {
 
                 match self
                     .services
+                    .user_input
                     .resolve_user_input_choice(
                         request_id,
                         chat_id,
@@ -425,6 +435,7 @@ impl App {
                 })?);
                 match self
                     .services
+                    .plans
                     .resolve_plan_follow_up_implement(follow_up_id, chat_id, user_id)
                     .await?
                 {
@@ -463,6 +474,7 @@ impl App {
                 })?);
                 match self
                     .services
+                    .plans
                     .resolve_plan_follow_up_refine(follow_up_id, chat_id, user_id)
                     .await?
                 {
@@ -476,7 +488,12 @@ impl App {
                     PlanFollowUpCallbackResult::Implement { .. } => unreachable!(),
                 }
             } else if let Some(model) = data.strip_prefix("model-set:") {
-                match self.services.select_chat_model(chat_id, model).await? {
+                match self
+                    .services
+                    .model
+                    .select_chat_model(chat_id, model)
+                    .await?
+                {
                     ModelCallbackResult::Render(text, markup) => {
                         self.services
                             .telegram
@@ -501,6 +518,7 @@ impl App {
             } else if let Some(effort) = data.strip_prefix("model-effort:") {
                 let text = self
                     .services
+                    .model
                     .select_chat_reasoning_effort(chat_id, effort)
                     .await?;
                 self.services
@@ -511,6 +529,7 @@ impl App {
             } else {
                 match self
                     .services
+                    .folder
                     .handle_folder_callback(chat_id, user_id, data)
                     .await?
                 {

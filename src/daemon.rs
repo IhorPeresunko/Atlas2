@@ -35,7 +35,10 @@ fn resolve_self_exe() -> AppResult<PathBuf> {
 /// Returns the first of `exe` / `exe` with a trailing `" (deleted)"` stripped
 /// that satisfies `exists`. Pure helper so the deleted-inode handling can be
 /// unit tested without replacing the running binary.
-fn clean_exe_path(exe: &std::path::Path, exists: impl Fn(&std::path::Path) -> bool) -> Option<PathBuf> {
+fn clean_exe_path(
+    exe: &std::path::Path,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Option<PathBuf> {
     if exists(exe) {
         return Some(exe.to_path_buf());
     }
@@ -183,13 +186,12 @@ pub fn start(args: &ServeArgs) -> AppResult<()> {
         });
     }
 
-    let child = command
-        .spawn()
-        .map_err(|error| AppError::Config(format!("failed to spawn background process: {error}")))?;
-
-    fs::write(pid_file()?, child.id().to_string()).map_err(|error| {
-        AppError::Config(format!("failed to write PID file: {error}"))
+    let child = command.spawn().map_err(|error| {
+        AppError::Config(format!("failed to spawn background process: {error}"))
     })?;
+
+    fs::write(pid_file()?, child.id().to_string())
+        .map_err(|error| AppError::Config(format!("failed to write PID file: {error}")))?;
     persist_serve_provider(args.stt_provider)?;
 
     println!("Atlas2 started (pid {}).", child.id());

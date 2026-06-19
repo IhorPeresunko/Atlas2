@@ -262,8 +262,9 @@ impl CodexClient {
                                 efforts
                                     .iter()
                                     .filter_map(|effort| {
-                                        let slug =
-                                            effort.get("reasoningEffort").and_then(Value::as_str)?;
+                                        let slug = effort
+                                            .get("reasoningEffort")
+                                            .and_then(Value::as_str)?;
                                         Some(ReasoningEffortOption {
                                             effort: slug.to_string(),
                                             description: effort
@@ -407,7 +408,16 @@ impl CodexApi for CodexClient {
         reasoning_effort: Option<&str>,
         on_event: Box<dyn FnMut(CodexEvent) -> AppResult<()> + Send>,
     ) -> AppResult<CodexTurnResult> {
-        CodexClient::run_turn(self, session, prompt, mode, model, reasoning_effort, on_event).await
+        CodexClient::run_turn(
+            self,
+            session,
+            prompt,
+            mode,
+            model,
+            reasoning_effort,
+            on_event,
+        )
+        .await
     }
 
     async fn resolve_approval(
@@ -1536,11 +1546,10 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use super::{
-        CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS, CodexEvent,
-        ToolRequestUserInputParams, build_collaboration_mode, build_resume_cursor_json,
-        extract_proposed_plan_markdown, extract_thread_id, extract_turn_id,
-        is_stale_thread_error_message, map_item_completed, map_notification,
-        map_task_complete_notification, should_restart_thread_from_resume_error,
+        CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS, CodexEvent, ToolRequestUserInputParams,
+        build_collaboration_mode, build_resume_cursor_json, extract_proposed_plan_markdown,
+        extract_thread_id, extract_turn_id, is_stale_thread_error_message, map_item_completed,
+        map_notification, map_task_complete_notification, should_restart_thread_from_resume_error,
         should_retry_with_fresh_thread_after_failure, summarize_approval_request,
         supports_telegram_user_input_questions,
     };

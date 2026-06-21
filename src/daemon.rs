@@ -109,8 +109,9 @@ fn process_alive(pid: i32) -> bool {
     if result == 0 {
         return true;
     }
-    let errno = unsafe { *libc::__errno_location() };
-    errno == libc::EPERM
+    // Read errno portably (the glibc `__errno_location` symbol does not exist on
+    // macOS). `last_os_error` reads errno right after the failed `kill`.
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Launches Atlas2 as a detached background process and returns immediately.
@@ -205,9 +206,9 @@ pub fn stop() -> AppResult<()> {
         Some(pid) => {
             let result = unsafe { libc::kill(pid, libc::SIGTERM) };
             if result != 0 {
-                let errno = unsafe { *libc::__errno_location() };
+                let error = std::io::Error::last_os_error();
                 return Err(AppError::Config(format!(
-                    "failed to stop Atlas2 (pid {pid}): errno {errno}"
+                    "failed to stop Atlas2 (pid {pid}): {error}"
                 )));
             }
             let _ = fs::remove_file(pid_file()?);

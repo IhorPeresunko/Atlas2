@@ -99,7 +99,6 @@ impl CodexClient {
                     .open_thread(
                         resume_thread_id.as_ref(),
                         session.resume_cursor_json.as_deref(),
-                        mode,
                     )
                     .await?;
 
@@ -676,15 +675,10 @@ impl AppServerRuntime {
         &mut self,
         provider_thread_id: Option<&CodexThreadId>,
         _resume_cursor_json: Option<&str>,
-        mode: PromptMode,
     ) -> AppResult<ThreadOpenState> {
-        let mut params = json!({
+        let params = json!({
             "cwd": self.workspace_path,
         });
-        if mode == PromptMode::Plan {
-            params["approvalPolicy"] = json!("on-request");
-            params["sandbox"] = json!("read-only");
-        }
 
         let start_params = params.clone();
         let (result, recovery_message) = if let Some(thread_id) = provider_thread_id {
@@ -739,14 +733,6 @@ impl AppServerRuntime {
             }],
         });
 
-        if mode == PromptMode::Plan {
-            let sandbox_policy = json!({
-                "type": "readOnly",
-                "networkAccess": false,
-            });
-            params["approvalPolicy"] = json!("on-request");
-            params["sandboxPolicy"] = sandbox_policy;
-        }
         params["collaborationMode"] = build_collaboration_mode(
             mode,
             self.model.as_deref(),

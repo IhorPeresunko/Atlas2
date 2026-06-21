@@ -41,6 +41,8 @@ pub trait Provider: Send + Sync {
     async fn list_models(&self, workspace_path: &str) -> AppResult<Vec<ModelOption>>;
 
     /// Run one turn to completion, streaming [`ProviderEvent`]s to `on_event`.
+    /// `dangerously_skip_permissions` lets the agent run tools without approval;
+    /// providers with their own approval flow (e.g. Codex) ignore it.
     async fn run_turn(
         &self,
         session: &SessionRecord,
@@ -48,6 +50,7 @@ pub trait Provider: Send + Sync {
         mode: PromptMode,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
+        dangerously_skip_permissions: bool,
         on_event: Box<dyn FnMut(ProviderEvent) -> AppResult<()> + Send>,
     ) -> AppResult<TurnResult>;
 

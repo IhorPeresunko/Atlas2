@@ -218,9 +218,15 @@ impl<Tg: TelegramApi + 'static> TurnService<Tg> {
         mode: PromptMode,
     ) -> AppResult<()> {
         let chat_binding = self.storage.get_chat(chat_id).await?;
-        let (mut model, reasoning_effort) = chat_binding
-            .map(|chat| (chat.model, chat.reasoning_effort))
-            .unwrap_or((None, None));
+        let (mut model, reasoning_effort, skip_permissions) = chat_binding
+            .map(|chat| {
+                (
+                    chat.model,
+                    chat.reasoning_effort,
+                    chat.dangerously_skip_permissions,
+                )
+            })
+            .unwrap_or((None, None, false));
         let session = self.require_active_session(chat_id).await?;
         // Some providers (e.g. Codex) reject a turn without a model. Resolve and
         // persist its default when the chat has none (e.g. a brand-new chat).
@@ -293,6 +299,7 @@ impl<Tg: TelegramApi + 'static> TurnService<Tg> {
                 mode,
                 model.as_deref(),
                 reasoning_effort.as_deref(),
+                skip_permissions,
                 Box::new(move |event| handler.handle(event)),
             )
             .await;
@@ -310,7 +317,7 @@ impl<Tg: TelegramApi + 'static> TurnService<Tg> {
                     interrupted = result.interrupted,
                     has_failure = result.failure.is_some(),
                     thread_id = result.thread_id.as_ref().map(|id| id.0.as_str()).unwrap_or(""),
-                    "Codex prompt finished"
+                    "provider prompt finished"
                 );
                 let live_turn = self.live_turns.lock().await.remove(&session.session_id);
                 let terminal_state = match &live_turn {
@@ -375,7 +382,7 @@ impl<Tg: TelegramApi + 'static> TurnService<Tg> {
                     chat_id = chat_id.0,
                     session_id = %session.session_id.0,
                     error = %error,
-                    "Codex prompt execution failed"
+                    "provider prompt execution failed"
                 );
                 let live_turn = self.live_turns.lock().await.remove(&session.session_id);
                 if let Some(live_turn) = live_turn {

@@ -378,6 +378,9 @@ impl Provider for CodexProvider {
         mode: PromptMode,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
+        // Codex surfaces its own approval flow via Telegram buttons, so the
+        // skip-permissions toggle does not apply.
+        _dangerously_skip_permissions: bool,
         on_event: Box<dyn FnMut(ProviderEvent) -> AppResult<()> + Send>,
     ) -> AppResult<TurnResult> {
         CodexProvider::run_turn(
@@ -611,13 +614,12 @@ impl AppServerRuntime {
                 AppError::Provider("missing provider thread id for turn start".into())
             })?;
 
-        let turn_prompt = build_codex_prompt(prompt, mode);
         let mut params = json!({
             "threadId": thread_id.0,
             "cwd": self.workspace_path,
             "input": [{
                 "type": "text",
-                "text": turn_prompt,
+                "text": prompt,
                 "text_elements": [],
             }],
         });
@@ -1375,42 +1377,6 @@ fn build_collaboration_mode(
         "mode": mode_name,
         "settings": settings,
     })
-}
-
-pub(crate) fn build_codex_prompt(prompt: &str, mode: PromptMode) -> String {
-    match mode {
-        PromptMode::Normal => prompt.to_string(),
-        PromptMode::Plan => format!(
-            concat!(
-                "You are in Atlas2 plan mode.\n",
-                "Analyze the request and return a concrete implementation plan only.\n",
-                "Do not modify files, do not apply patches, and do not run write operations.\n",
-                "You may inspect the codebase and run non-mutating commands as needed.\n",
-                "\n",
-                "Plan mode rules:\n",
-                "- Stay in plan mode until a developer message explicitly ends it.\n",
-                "- If the user asks you to implement while still in plan mode, treat it as a request to plan the implementation.\n",
-                "- Ask follow-up questions when they materially change the plan or confirm an important assumption.\n",
-                "- Strongly prefer the request_user_input tool for those follow-up questions whenever the choice can be expressed with meaningful options.\n",
-                "- Prefer exploring the repository before asking questions that can be answered from local context.\n",
-                "\n",
-                "Finalization rules:\n",
-                "- Only present the final plan when it is decision-complete and leaves no important decisions to the implementer.\n",
-                "- When you present the official plan, wrap it in a <proposed_plan> block exactly like this:\n",
-                "<proposed_plan>\n",
-                "# Plan title\n",
-                "...\n",
-                "</proposed_plan>\n",
-                "- The opening and closing tags must each be on their own line.\n",
-                "- Use Markdown inside the block.\n",
-                "- Output at most one <proposed_plan> block per turn.\n",
-                "- Do not ask \"should I proceed?\" after the final plan.\n",
-                "\n",
-                "User request:\n{}"
-            ),
-            prompt
-        ),
-    }
 }
 
 #[cfg(test)]

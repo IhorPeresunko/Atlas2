@@ -114,6 +114,31 @@ impl<Tg: TelegramApi + 'static> AppServices<Tg> {
         require_group_admin(&self.telegram, chat_id, user_id).await
     }
 
+    /// Toggles whether the chat's agent skips permission prompts (`/yolo`).
+    /// `desired` of `None` flips the current value. Admin-only, since it lets the
+    /// agent run tools without approval.
+    pub async fn set_skip_permissions(
+        &self,
+        chat_id: TelegramChatId,
+        user_id: TelegramUserId,
+        desired: Option<bool>,
+    ) -> AppResult<String> {
+        self.require_group_admin(chat_id, user_id).await?;
+        let current = self
+            .storage
+            .get_chat(chat_id)
+            .await?
+            .map(|chat| chat.dangerously_skip_permissions)
+            .unwrap_or(false);
+        let next = desired.unwrap_or(!current);
+        self.storage.set_chat_skip_permissions(chat_id, next).await?;
+        Ok(if next {
+            "Permission skipping is ON. Claude will edit files and run commands without asking in this chat. Send /yolo off to disable.\nCodex sessions are unaffected — they still ask via approval buttons.".into()
+        } else {
+            "Permission skipping is OFF. Claude will not run tools that need permission; it will tell you what it was blocked from.".into()
+        })
+    }
+
     pub async fn render_sessions(&self) -> AppResult<String> {
         let sessions = self.storage.list_sessions().await?;
         if sessions.is_empty() {
@@ -153,7 +178,6 @@ mod tests {
         UserInputQuestion, UserInputRequestId, UserInputStatus, WorkspacePath,
     };
     use crate::{
-        provider::codex::build_codex_prompt,
         domain::PromptMode,
         presentation::{
             TELEGRAM_TEXT_LIMIT, TelegramTurnUpdate, TurnTerminalState, compact_text_for_telegram,
@@ -284,23 +308,6 @@ mod tests {
         let text = render_turn_terminal_text("Codex", TurnTerminalState::Stopped, None);
 
         assert_eq!(text, "Codex turn stopped.");
-    }
-
-    #[test]
-    fn leaves_normal_prompt_unchanged() {
-        assert_eq!(
-            build_codex_prompt("fix the bug", PromptMode::Normal),
-            "fix the bug"
-        );
-    }
-
-    #[test]
-    fn wraps_plan_prompt_with_plan_contract() {
-        let prompt = build_codex_prompt("trace the approval flow", PromptMode::Plan);
-
-        assert!(prompt.contains("Atlas2 plan mode"));
-        assert!(prompt.contains("return a concrete implementation plan only"));
-        assert!(prompt.contains("trace the approval flow"));
     }
 
     #[test]
@@ -567,6 +574,7 @@ mod tests {
             _mode: PromptMode,
             _model: Option<&str>,
             _reasoning_effort: Option<&str>,
+            _dangerously_skip_permissions: bool,
             _on_event: Box<dyn FnMut(ProviderEvent) -> AppResult<()> + Send>,
         ) -> AppResult<TurnResult> {
             Ok(TurnResult::default())

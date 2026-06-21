@@ -73,6 +73,7 @@ impl ClaudeProvider {
         mode: PromptMode,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
+        dangerously_skip_permissions: bool,
         mut on_event: F,
     ) -> AppResult<TurnResult>
     where
@@ -99,6 +100,7 @@ impl ClaudeProvider {
             mode,
             model,
             reasoning_effort,
+            dangerously_skip_permissions,
             &session_arg,
         )
         .await?;
@@ -217,6 +219,7 @@ impl Provider for ClaudeProvider {
         mode: PromptMode,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
+        dangerously_skip_permissions: bool,
         on_event: Box<dyn FnMut(ProviderEvent) -> AppResult<()> + Send>,
     ) -> AppResult<TurnResult> {
         ClaudeProvider::run_turn(
@@ -226,6 +229,7 @@ impl Provider for ClaudeProvider {
             mode,
             model,
             reasoning_effort,
+            dangerously_skip_permissions,
             on_event,
         )
         .await
@@ -316,6 +320,7 @@ impl ClaudeRuntime {
         mode: PromptMode,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
+        dangerously_skip_permissions: bool,
         session_arg: &SessionArg,
     ) -> AppResult<Self> {
         let mut command = Command::new(claude_bin);
@@ -324,7 +329,10 @@ impl ClaudeRuntime {
             .args(["--output-format", "stream-json"])
             .args(["--input-format", "stream-json"])
             .arg("--verbose")
-            .args(["--permission-mode", permission_mode(mode)]);
+            .args([
+                "--permission-mode",
+                permission_mode(mode, dangerously_skip_permissions),
+            ]);
         match session_arg {
             SessionArg::Fresh(id) => {
                 command.args(["--session-id", id]);
@@ -587,9 +595,44 @@ fn map_stream_event(value: &Value, commands: &mut HashMap<String, String>) -> Ve
         }
         Some("assistant") => map_assistant_message(value, commands),
         Some("user") => map_tool_results(value, commands),
-        Some("result") => vec![map_result(value)],
+        Some("result") => {
+            let mut events = Vec::new();
+            // When permissions are not skipped, headless Claude silently declines
+            // tools it would otherwise prompt for. Surface that so the user knows
+            // why nothing happened and how to allow it.
+            if let Some(note) = permission_denial_note(value) {
+                events.push(ProviderEvent::Output { text: note });
+            }
+            events.push(map_result(value));
+            events
+        }
         _ => Vec::new(),
     }
+}
+
+/// Builds a user-facing note when a turn's `result` reports tools that were
+/// blocked for lack of permission. Returns `None` when nothing was denied.
+fn permission_denial_note(value: &Value) -> Option<String> {
+    let denials = value.get("permission_denials")?.as_array()?;
+    if denials.is_empty() {
+        return None;
+    }
+    let mut tools: Vec<&str> = denials
+        .iter()
+        .filter_map(|denial| denial.get("tool_name").and_then(Value::as_str))
+        .collect();
+    tools.sort_unstable();
+    tools.dedup();
+    let tool_list = if tools.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", tools.join(", "))
+    };
+    Some(format!(
+        "Claude was blocked from {} action(s){tool_list} that need permission. \
+         Run /yolo to let Claude run tools without asking in this chat.",
+        denials.len()
+    ))
 }
 
 fn map_assistant_message(value: &Value, commands: &mut HashMap<String, String>) -> Vec<ProviderEvent> {
@@ -718,16 +761,65 @@ fn summarize_permission(tool_name: &str, input: &Value) -> String {
     format!("Claude wants to use the {tool_name} tool.")
 }
 
-fn permission_mode(mode: PromptMode) -> &'static str {
+fn permission_mode(mode: PromptMode, dangerously_skip_permissions: bool) -> &'static str {
     match mode {
-        PromptMode::Normal => "default",
+        // Plan mode is read-only regardless of the skip toggle.
         PromptMode::Plan => "plan",
+        // `bypassPermissions` runs tools without asking; `default` makes headless
+        // Claude auto-decline tools that would need approval.
+        PromptMode::Normal if dangerously_skip_permissions => "bypassPermissions",
+        PromptMode::Normal => "default",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// End-to-end check that a skip-permissions turn actually runs a tool through
+    /// Atlas2's own ClaudeProvider path. Ignored by default because it spawns the
+    /// real `claude` binary (needs auth, costs tokens). Run with:
+    /// `cargo test --bin atlas2 -- --ignored claude_skip_permissions_writes_file`
+    #[tokio::test]
+    #[ignore]
+    async fn claude_skip_permissions_writes_file() {
+        use crate::domain::{ProviderKind, SessionId, SessionStatus, WorkspacePath};
+        use chrono::Utc;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().to_string_lossy().into_owned();
+        let provider = ClaudeProvider::new("claude".into(), Vec::new());
+        let session = SessionRecord {
+            session_id: SessionId::new(),
+            chat_id: crate::domain::TelegramChatId(1),
+            workspace_path: WorkspacePath(workspace.clone()),
+            provider: ProviderKind::Claude,
+            provider_thread_id: None,
+            resume_cursor_json: None,
+            status: SessionStatus::Ready,
+            last_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let result = provider
+            .run_turn(
+                &session,
+                "Create a file called hello.txt containing the word hi. Just do it.",
+                PromptMode::Normal,
+                Some("sonnet"),
+                None,
+                true, // dangerously_skip_permissions
+                |_event| Ok(()),
+            )
+            .await
+            .expect("turn runs");
+
+        assert!(result.completed, "turn should complete: {result:?}");
+        let written = std::fs::read_to_string(temp.path().join("hello.txt"))
+            .expect("hello.txt should have been written under bypassPermissions");
+        assert!(written.contains("hi"));
+    }
 
     #[test]
     fn maps_init_to_thread_started() {
@@ -830,9 +922,34 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_uses_plan_permission() {
-        assert_eq!(permission_mode(PromptMode::Plan), "plan");
-        assert_eq!(permission_mode(PromptMode::Normal), "default");
+    fn permission_mode_reflects_plan_and_skip_toggle() {
+        // Plan is read-only regardless of the skip toggle.
+        assert_eq!(permission_mode(PromptMode::Plan, false), "plan");
+        assert_eq!(permission_mode(PromptMode::Plan, true), "plan");
+        assert_eq!(permission_mode(PromptMode::Normal, false), "default");
+        assert_eq!(
+            permission_mode(PromptMode::Normal, true),
+            "bypassPermissions"
+        );
+    }
+
+    #[test]
+    fn permission_denial_note_lists_blocked_tools() {
+        let note = permission_denial_note(&json!({
+            "permission_denials": [
+                {"tool_name": "Write"},
+                {"tool_name": "Bash"},
+                {"tool_name": "Write"}
+            ]
+        }))
+        .expect("a note for denied tools");
+        assert!(note.contains("Bash"));
+        assert!(note.contains("Write"));
+        assert!(note.contains("/yolo"));
+
+        // No denials -> no note.
+        assert!(permission_denial_note(&json!({"permission_denials": []})).is_none());
+        assert!(permission_denial_note(&json!({})).is_none());
     }
 
     #[test]

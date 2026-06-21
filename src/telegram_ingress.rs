@@ -215,6 +215,15 @@ where
                         .send_message(chat_id, &text, None, None)
                         .await?;
                 }
+                IncomingMessage::Yolo(desired) => {
+                    let text = services
+                        .set_skip_permissions(chat_id, user_id, desired)
+                        .await?;
+                    services
+                        .telegram
+                        .send_message(chat_id, &text, None, None)
+                        .await?;
+                }
                 IncomingMessage::UnknownCommand => {
                     services
                         .telegram
@@ -544,6 +553,7 @@ fn incoming_message_name(message: &IncomingMessage<'_>) -> &'static str {
         IncomingMessage::PlanUsage => "plan_usage",
         IncomingMessage::ModelMenu => "model_menu",
         IncomingMessage::SetModel(_) => "set_model",
+        IncomingMessage::Yolo(_) => "yolo",
         IncomingMessage::UnknownCommand => "unknown_command",
         IncomingMessage::Prompt(_) => "prompt",
     }
@@ -569,6 +579,7 @@ pub(crate) fn bot_commands() -> Vec<BotCommand> {
         BotCommand::new("sessions", "List known sessions"),
         BotCommand::new("plan", "Run a read-only planning turn"),
         BotCommand::new("model", "Pick or set the model"),
+        BotCommand::new("yolo", "Toggle skipping Claude permission prompts (dangerous)"),
     ]
 }
 
@@ -582,6 +593,9 @@ enum IncomingMessage<'a> {
     PlanUsage,
     ModelMenu,
     SetModel(&'a str),
+    /// Toggle skipping the agent's permission prompts. `None` flips the current
+    /// state; `Some(_)` sets it explicitly (`/yolo on` / `/yolo off`).
+    Yolo(Option<bool>),
     UnknownCommand,
     Prompt(&'a str),
 }
@@ -613,6 +627,11 @@ fn parse_message_text(text: &str) -> IncomingMessage<'_> {
                 IncomingMessage::SetModel(model)
             }
         }
+        "/yolo" => match rest.trim().to_ascii_lowercase().as_str() {
+            "on" | "true" | "1" => IncomingMessage::Yolo(Some(true)),
+            "off" | "false" | "0" => IncomingMessage::Yolo(Some(false)),
+            _ => IncomingMessage::Yolo(None),
+        },
         _ => IncomingMessage::UnknownCommand,
     }
 }
@@ -653,6 +672,22 @@ mod tests {
             parse_message_text("/plan@atlas2codingbot"),
             IncomingMessage::PlanUsage
         );
+    }
+
+    #[test]
+    fn parses_yolo_command_variants() {
+        assert_eq!(parse_message_text("/yolo"), IncomingMessage::Yolo(None));
+        assert_eq!(
+            parse_message_text("/yolo@atlas2codingbot"),
+            IncomingMessage::Yolo(None)
+        );
+        assert_eq!(parse_message_text("/yolo on"), IncomingMessage::Yolo(Some(true)));
+        assert_eq!(
+            parse_message_text("/yolo OFF"),
+            IncomingMessage::Yolo(Some(false))
+        );
+        // Unrecognized argument falls back to a plain toggle.
+        assert_eq!(parse_message_text("/yolo maybe"), IncomingMessage::Yolo(None));
     }
 
     #[test]
@@ -716,7 +751,7 @@ mod tests {
         assert_eq!(
             commands,
             vec![
-                "start", "help", "new", "resume", "sessions", "plan", "model"
+                "start", "help", "new", "resume", "sessions", "plan", "model", "yolo"
             ]
         );
     }

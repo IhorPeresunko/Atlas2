@@ -106,10 +106,14 @@ pub struct ChatBinding {
     pub active_session_id: Option<SessionId>,
     pub chat_kind: String,
     pub title: Option<String>,
-    /// Per-chat Codex model preference; `None` means use Codex core's default.
+    /// Per-chat model preference; `None` means use the provider's default.
     pub model: Option<String>,
     /// Per-chat reasoning effort; `None` means use the model's default effort.
     pub reasoning_effort: Option<String>,
+    /// When set, the agent runs tools without asking for approval. Maps to
+    /// Claude's `bypassPermissions` mode; ignored by providers that surface
+    /// their own approval flow (e.g. Codex).
+    pub dangerously_skip_permissions: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

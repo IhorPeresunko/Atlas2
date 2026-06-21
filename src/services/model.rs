@@ -297,6 +297,7 @@ mod tests {
             _mode: PromptMode,
             _model: Option<&str>,
             _reasoning_effort: Option<&str>,
+            _dangerously_skip_permissions: bool,
             _on_event: Box<dyn FnMut(ProviderEvent) -> AppResult<()> + Send>,
         ) -> AppResult<TurnResult> {
             Ok(TurnResult::default())

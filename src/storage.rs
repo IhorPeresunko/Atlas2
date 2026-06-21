@@ -48,7 +48,8 @@ impl Storage {
                 title TEXT,
                 active_session_id TEXT,
                 model TEXT,
-                reasoning_effort TEXT
+                reasoning_effort TEXT,
+                dangerously_skip_permissions INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS sessions (
@@ -119,6 +120,8 @@ impl Storage {
         self.ensure_session_column("last_error", "TEXT").await?;
         self.ensure_chat_column("model", "TEXT").await?;
         self.ensure_chat_column("reasoning_effort", "TEXT").await?;
+        self.ensure_chat_column("dangerously_skip_permissions", "INTEGER NOT NULL DEFAULT 0")
+            .await?;
         Ok(())
     }
 
@@ -185,7 +188,8 @@ impl Storage {
     pub async fn get_chat(&self, chat_id: TelegramChatId) -> AppResult<Option<ChatBinding>> {
         let row = sqlx::query(
             r#"
-            SELECT chat_id, active_session_id, chat_kind, title, model, reasoning_effort
+            SELECT chat_id, active_session_id, chat_kind, title, model, reasoning_effort,
+                   dangerously_skip_permissions
             FROM chats
             WHERE chat_id = ?1
             "#,
@@ -259,6 +263,29 @@ impl Storage {
         )
         .bind(chat_id.0)
         .bind(reasoning_effort)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Sets whether the chat's agent skips permission prompts (Claude's
+    /// `bypassPermissions`). Upserts so it can be toggled before any session.
+    pub async fn set_chat_skip_permissions(
+        &self,
+        chat_id: TelegramChatId,
+        skip: bool,
+    ) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO chats (chat_id, chat_kind, dangerously_skip_permissions)
+            VALUES (?1, 'unknown', ?2)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                dangerously_skip_permissions = excluded.dangerously_skip_permissions
+            "#,
+        )
+        .bind(chat_id.0)
+        .bind(i64::from(skip))
         .execute(&self.pool)
         .await?;
 
@@ -865,6 +892,7 @@ fn map_chat_binding(row: sqlx::sqlite::SqliteRow) -> AppResult<ChatBinding> {
         title: row.get::<Option<String>, _>("title"),
         model: row.get::<Option<String>, _>("model"),
         reasoning_effort: row.get::<Option<String>, _>("reasoning_effort"),
+        dangerously_skip_permissions: row.get::<i64, _>("dangerously_skip_permissions") != 0,
     })
 }
 
@@ -1019,10 +1047,30 @@ mod tests {
                 title: Some("Atlas".into()),
                 model: None,
                 reasoning_effort: None,
+                dangerously_skip_permissions: false,
             })
         );
         assert_eq!(active.workspace_path.0, "/tmp/project");
         assert_eq!(active.provider, ProviderKind::Codex);
+    }
+
+    #[tokio::test]
+    async fn stores_and_toggles_skip_permissions() {
+        let storage = Storage::connect("sqlite::memory:").await.unwrap();
+        let chat_id = TelegramChatId(42);
+        storage.upsert_chat(chat_id, "group", None).await.unwrap();
+
+        // Defaults to off.
+        let chat = storage.get_chat(chat_id).await.unwrap().unwrap();
+        assert!(!chat.dangerously_skip_permissions);
+
+        storage.set_chat_skip_permissions(chat_id, true).await.unwrap();
+        let chat = storage.get_chat(chat_id).await.unwrap().unwrap();
+        assert!(chat.dangerously_skip_permissions);
+
+        storage.set_chat_skip_permissions(chat_id, false).await.unwrap();
+        let chat = storage.get_chat(chat_id).await.unwrap().unwrap();
+        assert!(!chat.dangerously_skip_permissions);
     }
 
     #[tokio::test]

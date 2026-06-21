@@ -125,6 +125,38 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> TurnService<Cx, Tg> {
         Ok("Stopping Codex turn.".into())
     }
 
+    /// Best-effort cancellation of whatever turn is currently running in a chat.
+    /// Used when `/new` supersedes the active session: a parked turn (e.g. one
+    /// waiting on approvals) would otherwise keep holding the per-chat turn lock
+    /// and wedge the chat. No-op when nothing is running.
+    pub async fn cancel_active_turn(&self, chat_id: TelegramChatId) {
+        let session_id = {
+            let mut live_turns = self.live_turns.lock().await;
+            match live_turns
+                .iter_mut()
+                .find(|(_, live_turn)| live_turn.chat_id == chat_id)
+            {
+                Some((session_id, live_turn)) => {
+                    if live_turn.stop_requested {
+                        return;
+                    }
+                    live_turn.stop_requested = true;
+                    session_id.clone()
+                }
+                None => return,
+            }
+        };
+        let _ = self.codex.stop_turn(&session_id).await;
+        let _ = self
+            .storage
+            .expire_pending_approvals_for_session(&session_id)
+            .await;
+        let _ = self
+            .storage
+            .expire_pending_user_inputs_for_session(&session_id)
+            .await;
+    }
+
     pub async fn run_voice_prompt(
         &self,
         chat_id: TelegramChatId,

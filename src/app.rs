@@ -175,6 +175,9 @@ impl App {
                     }
                     IncomingMessage::NewSession => {
                         self.services.require_group_admin(chat_id, user_id).await?;
+                        // Starting fresh supersedes any in-flight turn for this
+                        // chat; cancel it so it does not keep holding the turn lock.
+                        self.services.turns.cancel_active_turn(chat_id).await;
                         let (text, markup) =
                             self.services.folder.begin_new_session(chat_id).await?;
                         self.services

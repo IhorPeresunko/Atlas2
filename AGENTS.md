@@ -120,12 +120,25 @@ Core product behavior:
 - Keep documentation concise and accurate.
 - Update existing docs when architecture or behavior changes.
 - Do not create speculative docs for features that do not exist yet.
+- Put content where it belongs:
+  - `README.md` is for **end users** only: commands and how to use the tool.
+  - `AGENTS.md` is for **developers/agents**: workflow, conventions, and rules.
+  - `docs/` holds **functional requirements** and architecture.
 
 ---
 
 ## Build and Release
 
 - Build/run from a source checkout with `cargo run -- <command>` (e.g. `cargo run -- run` for a foreground server, `cargo run -- status`). `cargo install --path .` installs the local build into `~/.cargo/bin`.
+- To test a change against the live bot **without cutting a release**, run the dev build as the detached daemon. It reuses the stored token, DB, and config, and writes its PID to `~/.local/state/atlas2/atlas2.pid` and logs to `~/.local/state/atlas2/atlas2.log` — the same files the installed binary uses, so there is exactly one tracked instance at a time. Edit/test loop:
+  ```bash
+  cargo build                   # produces ./target/debug/atlas2
+  ./target/debug/atlas2 stop    # stop the currently-running instance (if any)
+  ./target/debug/atlas2 start   # start the freshly-built binary, detached
+  ./target/debug/atlas2 status  # confirm it is running
+  tail -f ~/.local/state/atlas2/atlas2.log
+  ```
+  Overwriting the binary does nothing to an already-running process, so always `stop` then `start` to pick up a rebuild — then you are testing only the new build. Only one instance may poll the bot (a second gets a Telegram 409), so do not also run the installed `~/.cargo/bin/atlas2` daemon at the same time. Restart recovers cleanly: startup marks interrupted turns failed and resets in-memory state.
 - Releases are produced by [`dist`](https://opensource.axo.dev/cargo-dist/), configured in `dist-workspace.toml` (Linux x86_64 gnu + static musl, shell installer, GitHub hosting). Regenerate the workflow with `dist generate` after changing that config.
 - To cut a release: bump `version` in `Cargo.toml`, commit, then push a matching tag (`git tag vX.Y.Z && git push origin vX.Y.Z`). The GitHub Actions release workflow builds the binaries and publishes the installer and assets.
 - `atlas2 upgrade` self-updates via the `axoupdater` library using the install receipt the installer writes; it only works for installer-based installs, not `cargo install`. Validating an upgrade-restart change end-to-end requires the fix to be in the *running* version before the upgrade, so it typically takes a follow-up release to confirm.

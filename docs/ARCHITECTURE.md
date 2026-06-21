@@ -6,7 +6,11 @@ Atlas2 is a single-process Rust service that connects Telegram groups to Codex C
 
 - The process starts locally, parses CLI flags, loads the Telegram bot token from the environment or a local persisted token file, and prompts only when neither source is available.
 - Optional ElevenLabs STT support is enabled with `--stt-provider 11labs`; when enabled, the process loads the API key from CLI or a local persisted key file and prompts only when neither source is available.
-- The service depends on a locally installed and authenticated `codex` binary.
+- The service depends on locally installed and authenticated coding-agent
+  binaries. Every supported provider (Codex, Claude) is built and registered at
+  startup; a chat picks one per session in `/new`, and that choice is recorded
+  on the session so its turns dispatch to the right provider. A session can only
+  use a provider whose binary is present.
 - Telegram updates arrive through long polling.
 - SQLite stores durable state in a local file.
 
@@ -53,8 +57,21 @@ Atlas2 is a single-process Rust service that connects Telegram groups to Codex C
   - Owns session lifecycle, approval decisions, folder-browser state transitions, and prompt orchestration.
 - `telegram`
   - Owns Bot API transport, long polling, callback answers, admin lookup, and message send/edit operations.
-- `codex`
-  - Owns Codex CLI app-server invocation, JSON-RPC transport, live approval routing, and event mapping.
+- `provider`
+  - Owns the provider-agnostic seam every other subsystem depends on: the
+    object-safe `Provider` trait (run/stop a turn, resolve approvals and
+    interactive input, report a model catalog), the `ThreadHistoryReader` trait
+    (discover and read prior threads for resume), the normalized `ProviderEvent`
+    vocabulary, and the `ProviderRegistry` / `ThreadReaderRegistry` (each a map of
+    `ProviderKind` to an `Arc<dyn ..>`). Services hold a registry and dispatch to
+    a provider by the session's `ProviderKind`; no business logic references a
+    concrete agent — only these types.
+  - `provider::codex` — Codex implementation: `codex app-server` invocation,
+    JSON-RPC transport, live approval routing, event mapping, and the
+    rollout-file reader.
+  - `provider::claude` — Claude implementation: the `claude` CLI in headless
+    `stream-json` mode, event mapping, permission (approval) handling over the
+    control protocol, and the transcript reader.
 - `stt`
   - Owns speech-to-text provider selection and ElevenLabs transcription requests.
 - `filesystem`
@@ -71,9 +88,11 @@ SQLite currently stores:
 - chats
   - Telegram chat identity, kind, title, and the active session binding
 - sessions
-  - Atlas2 session ID, chat binding, workspace path, backend marker, provider thread ID, resume cursor, runtime status, and last error
+  - Atlas2 session ID, chat binding, workspace path, owning provider (`codex`/`claude`), provider thread ID, resume cursor, runtime status, and last error
 - folder_browse_state
   - Current directory being browsed for each chat during `/new`
+- pending_new_session
+  - Workspace chosen during `/new`, held until the user picks a provider
 - pending_approvals
   - Approval payload, summary, status, and resolver metadata
 - pending_user_inputs
@@ -86,8 +105,8 @@ SQLite currently stores:
 - `/plan <prompt>` sends a read-only planning turn for the active session.
 - Telegram `voice` messages are downloaded, transcribed, echoed back into the group, and then routed as normal prompts for the active session.
 - Folder navigation uses compact callback tokens rather than raw full paths in callback data, because Telegram callback payload size is limited.
-- Selecting a folder replaces the folder-browser message with `Started new session in X`.
-- Groups stream Codex output as separate bot messages, preserving event order.
+- Selecting a folder (or reusing a historic project) then prompts for the agent: with more than one provider available, Atlas2 shows `Use Codex` / `Use Claude` buttons and only creates the session once one is tapped. With a single available provider the session is created directly.
+- Groups stream agent output as separate bot messages, preserving event order.
 - When a plain-text message exceeds Telegram's `sendMessage` size limit, the Telegram adapter splits it into ordered chunks before delivery.
 - Command completions are posted as formatted Telegram messages with the command summary visible and command output collapsed by default.
 - Each live turn also gets a separate control message with a `Stop` button. When the turn finishes or is interrupted, Atlas2 edits that control message into a terminal status and removes the button.
@@ -96,23 +115,37 @@ SQLite currently stores:
 - After a plan-mode turn produces a complete proposed plan, Atlas2 posts follow-up buttons. `Implement` starts a normal execution turn using a synthetic implementation prompt from the saved plan, while `Add details` treats the next plain Telegram message as plan refinement input.
 - Only Telegram group admins may create sessions, resolve approvals, or stop a running turn.
 
-## Codex Integration Model
+## Provider Integration Model
+
+Every provider implements the same `Provider` trait and normalizes its native
+events into the shared `ProviderEvent` vocabulary, so the turn orchestrator,
+approval flow, plan-mode follow-ups, and resume flow are written once. Each turn,
+approval, stop, and resume is dispatched through the `ProviderRegistry` to the
+provider recorded on the session, so Codex and Claude sessions coexist in one
+running instance. A turn spawns one live provider process; it stays alive while
+running or waiting for approval, then shuts down at idle. Shared event types:
+thread started, turn
+started/completed/failed/interrupted, streamed output, command started/finished,
+approval requests (approve/reject continuation), interactive user-input prompts,
+and completed plan artifacts.
+
+### Codex (`provider::codex`)
 
 - The first prompt after `/new` starts a fresh Codex session.
 - Later prompts spawn a fresh `codex app-server` process and resume the stored provider thread ID.
 - If `thread/resume` fails with Codex's invalid-encrypted-content error, Atlas2 falls back to `thread/start`, persists the new provider thread ID, and surfaces the context reset back into Telegram.
 - The selected workspace directory becomes the Codex working directory.
-- Plan-mode turns are expressed by Atlas2 as plan-only prompt instructions plus a read-only app-server sandbox policy.
-- Atlas2 uses one live app-server process per active Telegram turn. The process stays alive while a turn is running or waiting for approval, then is shut down once the turn reaches a stable idle state.
-- Atlas2 currently maps these app-server events into Telegram-facing domain events:
-  - thread started
-  - turn started/completed/failed
-  - turn interrupted
-  - agent message deltas
-  - command execution started/completed and output deltas
-  - approval requests with in-process approve/reject continuation
-  - interactive user-input prompts with in-process answer continuation
-  - completed plan artifacts that Atlas2 can turn into follow-up implementation/refinement actions
+- Plan-mode turns are expressed as plan-only prompt instructions plus a read-only app-server sandbox policy; the proposed plan is parsed from a `<proposed_plan>` block.
+- Interactive `request_user_input` prompts are surfaced as Telegram multiple-choice buttons.
+
+### Claude (`provider::claude`)
+
+- Runs `claude --print --output-format stream-json --input-format stream-json --verbose`, with `--session-id` to mint a controllable thread id on first use and `--resume <id>` afterwards.
+- Plan vs normal mode is selected with `--permission-mode plan|default`; the proposed plan arrives as the `ExitPlanMode` tool input and becomes a plan follow-up.
+- Assistant text becomes streamed output; `Bash` tool-use/result pairs become command started/finished events.
+- Permission prompts arrive as `can_use_tool` control requests and are answered (allow/deny) over stdin, mapping onto the same Telegram approval buttons.
+- Claude has no interactive `request_user_input` equivalent and no selectable reasoning-effort levels, so those steps are inert for this provider.
+- The model catalog (`sonnet`/`opus`/`haiku`) is advertised directly, since the CLI exposes no catalog endpoint.
 
 ## Constraints and Known Limits
 

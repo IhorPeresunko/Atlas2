@@ -1,20 +1,15 @@
 use crate::{
-    codex::CodexApi,
     domain::{ApprovalId, PlanFollowUpId, TelegramChatId, TelegramUserId, UserInputRequestId},
     error::{AppError, AppResult},
     services::{
         AppServices, FolderCallbackResult, ModelCallbackResult, PlanFollowUpCallbackResult,
         UserInputCallbackResult, UserInputTextResult,
     },
-    telegram::{TelegramApi, Update},
+    telegram::{BotCommand, TelegramApi, Update},
 };
 
-pub(crate) async fn handle_update<Cx, Tg>(
-    services: &AppServices<Cx, Tg>,
-    update: Update,
-) -> AppResult<()>
+pub(crate) async fn handle_update<Tg>(services: &AppServices<Tg>, update: Update) -> AppResult<()>
 where
-    Cx: CodexApi + 'static,
     Tg: TelegramApi + 'static,
 {
     let update_id = update.update_id;
@@ -120,7 +115,7 @@ where
                         .telegram
                         .send_message(
                             chat_id,
-                            "Atlas2 commands:\n/new - reuse a historic project or add a new project folder\n/resume - resume an existing Codex thread in the active session's workspace\n/sessions - list known sessions\n/plan <prompt> - run a read-only planning turn\n/model - pick the Codex model (or /model <name> to set it directly)\nAny other text - send a prompt to the active Codex session\nUse the Stop button on a running turn to interrupt it.",
+                            "Atlas2 commands:\n/new - reuse a historic project or add a new project folder\n/resume - resume an existing thread in the active session's workspace\n/sessions - list known sessions\n/plan <prompt> - run a read-only planning turn\n/model - pick the model (or /model <name> to set it directly)\nAny other text - send a prompt to the active session\nUse the Stop button on a running turn to interrupt it.",
                             None,
                             None,
                         )
@@ -384,7 +379,7 @@ where
                         .telegram
                         .edit_message_text(chat_id, message.message_id, &text, None, None)
                         .await?;
-                    Ok("Choice sent to Codex.".into())
+                    Ok("Choice sent.".into())
                 }
             }
         } else if let Some(id) = data.strip_prefix("plan-implement:") {
@@ -565,6 +560,18 @@ fn preview_text(text: &str) -> String {
     }
 }
 
+pub(crate) fn bot_commands() -> Vec<BotCommand> {
+    vec![
+        BotCommand::new("start", "Show intro and help"),
+        BotCommand::new("help", "Show available commands"),
+        BotCommand::new("new", "Choose or add a project folder"),
+        BotCommand::new("resume", "Resume an existing thread"),
+        BotCommand::new("sessions", "List known sessions"),
+        BotCommand::new("plan", "Run a read-only planning turn"),
+        BotCommand::new("model", "Pick or set the model"),
+    ]
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum IncomingMessage<'a> {
     Help,
@@ -580,52 +587,60 @@ enum IncomingMessage<'a> {
 }
 
 fn parse_message_text(text: &str) -> IncomingMessage<'_> {
-    match text {
+    if !text.starts_with('/') {
+        return IncomingMessage::Prompt(text);
+    }
+
+    let (command, rest) = split_command(text);
+    match command {
         "/start" | "/help" => IncomingMessage::Help,
         "/new" => IncomingMessage::NewSession,
         "/resume" => IncomingMessage::Resume,
         "/sessions" => IncomingMessage::Sessions,
-        "/plan" => IncomingMessage::PlanUsage,
-        "/model" => IncomingMessage::ModelMenu,
-        _ => {
-            if let Some(prompt) = text.strip_prefix("/plan ") {
-                let prompt = prompt.trim();
-                if prompt.is_empty() {
-                    IncomingMessage::PlanUsage
-                } else {
-                    IncomingMessage::Plan(prompt)
-                }
-            } else if let Some(prompt) = text.strip_prefix("/plan\n") {
-                let prompt = prompt.trim();
-                if prompt.is_empty() {
-                    IncomingMessage::PlanUsage
-                } else {
-                    IncomingMessage::Plan(prompt)
-                }
-            } else if let Some(model) = text.strip_prefix("/model ") {
-                let model = model.trim();
-                if model.is_empty() {
-                    IncomingMessage::ModelMenu
-                } else {
-                    IncomingMessage::SetModel(model)
-                }
-            } else if text.starts_with('/') {
-                IncomingMessage::UnknownCommand
+        "/plan" => {
+            let prompt = rest.trim();
+            if prompt.is_empty() {
+                IncomingMessage::PlanUsage
             } else {
-                IncomingMessage::Prompt(text)
+                IncomingMessage::Plan(prompt)
             }
         }
+        "/model" => {
+            let model = rest.trim();
+            if model.is_empty() {
+                IncomingMessage::ModelMenu
+            } else {
+                IncomingMessage::SetModel(model)
+            }
+        }
+        _ => IncomingMessage::UnknownCommand,
     }
+}
+
+fn split_command(text: &str) -> (&str, &str) {
+    let (command, rest) = match text.find(char::is_whitespace) {
+        Some(index) => (&text[..index], &text[index..]),
+        None => (text, ""),
+    };
+    let command = command
+        .split_once('@')
+        .map(|(command, _)| command)
+        .unwrap_or(command);
+    (command, rest)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{IncomingMessage, parse_message_text, preview_text};
+    use super::{IncomingMessage, bot_commands, parse_message_text, preview_text};
 
     #[test]
     fn parses_plan_command_with_inline_prompt() {
         assert_eq!(
             parse_message_text("/plan inspect the session flow"),
+            IncomingMessage::Plan("inspect the session flow")
+        );
+        assert_eq!(
+            parse_message_text("/plan@atlas2codingbot inspect the session flow"),
             IncomingMessage::Plan("inspect the session flow")
         );
     }
@@ -634,6 +649,10 @@ mod tests {
     fn rejects_empty_plan_command() {
         assert_eq!(parse_message_text("/plan"), IncomingMessage::PlanUsage);
         assert_eq!(parse_message_text("/plan   "), IncomingMessage::PlanUsage);
+        assert_eq!(
+            parse_message_text("/plan@atlas2codingbot"),
+            IncomingMessage::PlanUsage
+        );
     }
 
     #[test]
@@ -641,8 +660,36 @@ mod tests {
         assert_eq!(parse_message_text("/model"), IncomingMessage::ModelMenu);
         assert_eq!(parse_message_text("/model   "), IncomingMessage::ModelMenu);
         assert_eq!(
+            parse_message_text("/model@atlas2codingbot"),
+            IncomingMessage::ModelMenu
+        );
+        assert_eq!(
             parse_message_text("/model gpt-5.5"),
             IncomingMessage::SetModel("gpt-5.5")
+        );
+        assert_eq!(
+            parse_message_text("/model@atlas2codingbot gpt-5.5"),
+            IncomingMessage::SetModel("gpt-5.5")
+        );
+    }
+
+    #[test]
+    fn parses_mentioned_group_commands() {
+        assert_eq!(
+            parse_message_text("/help@atlas2codingbot"),
+            IncomingMessage::Help
+        );
+        assert_eq!(
+            parse_message_text("/new@atlas2codingbot"),
+            IncomingMessage::NewSession
+        );
+        assert_eq!(
+            parse_message_text("/resume@atlas2codingbot"),
+            IncomingMessage::Resume
+        );
+        assert_eq!(
+            parse_message_text("/sessions@atlas2codingbot"),
+            IncomingMessage::Sessions
         );
     }
 
@@ -657,5 +704,20 @@ mod tests {
     #[test]
     fn preview_text_compacts_whitespace() {
         assert_eq!(preview_text("hello\n\nworld"), "hello world");
+    }
+
+    #[test]
+    fn bot_commands_cover_supported_slash_commands() {
+        let commands: Vec<_> = bot_commands()
+            .into_iter()
+            .map(|command| command.command)
+            .collect();
+
+        assert_eq!(
+            commands,
+            vec![
+                "start", "help", "new", "resume", "sessions", "plan", "model"
+            ]
+        );
     }
 }

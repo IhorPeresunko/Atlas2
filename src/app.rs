@@ -1,8 +1,14 @@
+use std::{collections::HashMap, sync::Arc};
+
 use crate::{
-    codex::CodexClient,
     config::{Config, ServeArgs},
+    domain::ProviderKind,
     error::AppResult,
     filesystem::FilesystemService,
+    provider::{
+        ClaudeProvider, ClaudeThreadReader, CodexProvider, CodexThreadReader, Provider,
+        ProviderRegistry, ThreadHistoryReader, ThreadReaderRegistry,
+    },
     services::AppServices,
     storage::Storage,
     stt::SttClient,
@@ -20,19 +26,19 @@ impl App {
         let config = Config::load(args)?;
         ensure_database_parent_dir(&config.database_url)?;
         let storage = Storage::connect(&config.database_url).await?;
-        storage
-            .mark_interrupted_app_server_sessions_failed()
-            .await?;
+        storage.mark_interrupted_sessions_failed().await?;
         let telegram = TelegramClient::new(&config.telegram_api_base, &config.telegram_bot_token);
+        telegram
+            .set_my_commands(&telegram_ingress::bot_commands())
+            .await?;
         let filesystem = FilesystemService::default();
-        let codex = CodexClient::new(
-            config.codex_bin.clone(),
-            config.workspace_additional_writable_dirs.clone(),
-        );
+        let (providers, readers) = build_provider_registries(&config);
         let stt = SttClient::from_config(&config)?;
 
         Ok(Self {
-            services: AppServices::new(config, storage, telegram, filesystem, codex, stt),
+            services: AppServices::new(
+                config, storage, telegram, filesystem, providers, readers, stt,
+            ),
         })
     }
 
@@ -59,6 +65,35 @@ impl App {
     async fn handle_update(&self, update: crate::telegram::Update) -> AppResult<()> {
         telegram_ingress::handle_update(&self.services, update).await
     }
+}
+
+/// Builds every provider Atlas2 supports and registers it by kind, so a chat can
+/// pick one per session in `/new` and turns dispatch to the right one. This is
+/// the single composition root where concrete providers are named.
+fn build_provider_registries(config: &Config) -> (ProviderRegistry, ThreadReaderRegistry) {
+    let additional_dirs = config.workspace_additional_writable_dirs.clone();
+
+    let codex = CodexProvider::new(config.codex_bin.clone(), additional_dirs.clone());
+    let claude = ClaudeProvider::new(config.claude_bin.clone(), additional_dirs);
+
+    let mut providers: HashMap<ProviderKind, Arc<dyn Provider>> = HashMap::new();
+    providers.insert(ProviderKind::Codex, Arc::new(codex));
+    providers.insert(ProviderKind::Claude, Arc::new(claude));
+
+    let mut readers: HashMap<ProviderKind, Arc<dyn ThreadHistoryReader>> = HashMap::new();
+    readers.insert(
+        ProviderKind::Codex,
+        Arc::new(CodexThreadReader::new(config.codex_sessions_dir.clone())),
+    );
+    readers.insert(
+        ProviderKind::Claude,
+        Arc::new(ClaudeThreadReader::new(config.claude_sessions_dir.clone())),
+    );
+
+    (
+        ProviderRegistry::new(providers),
+        ThreadReaderRegistry::new(readers),
+    )
 }
 
 fn ensure_database_parent_dir(database_url: &str) -> AppResult<()> {

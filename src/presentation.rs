@@ -9,10 +9,10 @@ use regex::Regex;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
-    codex_sessions::{CodexConversationMessage, CodexMessageRole, CodexThreadSummary},
+    provider::{ConversationMessage, MessageRole, ThreadSummary},
     domain::{
-        HistoricProject, PendingPlanFollowUp, PendingUserInput, SessionId, TelegramChatId,
-        UserInputOption,
+        HistoricProject, PendingPlanFollowUp, PendingUserInput, ProviderKind, SessionId,
+        TelegramChatId, UserInputOption,
     },
     error::{AppError, AppResult},
     telegram::{InlineKeyboardMarkup, ParseMode, TelegramApi, button},
@@ -76,11 +76,28 @@ pub(crate) fn historic_projects_markup(projects: &[HistoricProject]) -> InlineKe
     InlineKeyboardMarkup::single_column(buttons)
 }
 
-pub(crate) fn render_resume_prompt(workspace: &str) -> String {
-    format!("Pick a Codex thread to resume in `{workspace}`:")
+pub(crate) fn render_provider_picker_prompt(workspace: &str) -> String {
+    format!("Workspace `{workspace}` selected.\nWhich agent should run this session?")
 }
 
-pub(crate) fn resume_threads_markup(threads: &[CodexThreadSummary]) -> InlineKeyboardMarkup {
+pub(crate) fn provider_picker_markup(kinds: &[ProviderKind]) -> InlineKeyboardMarkup {
+    let buttons = kinds
+        .iter()
+        .map(|kind| {
+            button(
+                format!("Use {}", kind.display_name()),
+                format!("newprovider-select:{}", kind.as_str()),
+            )
+        })
+        .collect();
+    InlineKeyboardMarkup::single_column(buttons)
+}
+
+pub(crate) fn render_resume_prompt(workspace: &str) -> String {
+    format!("Pick a thread to resume in `{workspace}`:")
+}
+
+pub(crate) fn resume_threads_markup(threads: &[ThreadSummary]) -> InlineKeyboardMarkup {
     let buttons = threads
         .iter()
         .map(|thread| {
@@ -93,7 +110,7 @@ pub(crate) fn resume_threads_markup(threads: &[CodexThreadSummary]) -> InlineKey
     InlineKeyboardMarkup::single_column(buttons)
 }
 
-fn resume_thread_label(thread: &CodexThreadSummary) -> String {
+fn resume_thread_label(thread: &ThreadSummary) -> String {
     let when = thread.started_at.format("%m-%d %H:%M");
     let preview = if thread.preview.is_empty() {
         "(no prompt)"
@@ -103,7 +120,7 @@ fn resume_thread_label(thread: &CodexThreadSummary) -> String {
     truncate_chars(&format!("{when}  {preview}"), 60)
 }
 
-pub(crate) fn render_resume_transcript(messages: &[CodexConversationMessage]) -> String {
+pub(crate) fn render_resume_transcript(messages: &[ConversationMessage]) -> String {
     if messages.is_empty() {
         return "(no messages found in this thread)".into();
     }
@@ -111,8 +128,8 @@ pub(crate) fn render_resume_transcript(messages: &[CodexConversationMessage]) ->
         .iter()
         .map(|message| {
             let speaker = match message.role {
-                CodexMessageRole::User => "You",
-                CodexMessageRole::Assistant => "Codex",
+                MessageRole::User => "You",
+                MessageRole::Assistant => "Assistant",
             };
             format!("{speaker}:\n{}", message.text)
         })
@@ -167,12 +184,12 @@ pub(crate) fn user_input_markup(request: &PendingUserInput) -> AppResult<InlineK
     })
 }
 
-pub(crate) fn render_user_input_prompt(request: &PendingUserInput) -> String {
+pub(crate) fn render_user_input_prompt(provider: &str, request: &PendingUserInput) -> String {
     let question_index = request.answers.len();
     let question = &request.questions[question_index];
 
     let mut lines = vec![format!(
-        "Codex needs your input ({}/{})",
+        "{provider} needs your input ({}/{})",
         question_index + 1,
         request.questions.len()
     )];
@@ -204,8 +221,8 @@ pub(crate) fn render_user_input_prompt(request: &PendingUserInput) -> String {
     trim_for_telegram(&lines.join("\n"))
 }
 
-pub(crate) fn render_user_input_summary(request: &PendingUserInput) -> String {
-    let mut lines = vec!["Sent your response to Codex.".into()];
+pub(crate) fn render_user_input_summary(provider: &str, request: &PendingUserInput) -> String {
+    let mut lines = vec![format!("Sent your response to {provider}.")];
     for question in &request.questions {
         if let Some(answer) = request.answers.get(&question.id) {
             lines.push(format!(
@@ -237,16 +254,20 @@ pub(crate) fn turn_control_markup(session_id: &SessionId) -> InlineKeyboardMarku
     InlineKeyboardMarkup::single_column(vec![button("Stop", format!("turn-stop:{}", session_id.0))])
 }
 
-pub(crate) fn render_turn_terminal_text(state: TurnTerminalState, detail: Option<&str>) -> String {
+pub(crate) fn render_turn_terminal_text(
+    provider: &str,
+    state: TurnTerminalState,
+    detail: Option<&str>,
+) -> String {
     match state {
-        TurnTerminalState::Completed => "Codex turn completed.".into(),
-        TurnTerminalState::Interrupted => "Codex turn interrupted.".into(),
-        TurnTerminalState::Stopped => "Codex turn stopped.".into(),
+        TurnTerminalState::Completed => format!("{provider} turn completed."),
+        TurnTerminalState::Interrupted => format!("{provider} turn interrupted."),
+        TurnTerminalState::Stopped => format!("{provider} turn stopped."),
         TurnTerminalState::Failed => match detail {
             Some(detail) if !detail.is_empty() => {
-                trim_for_telegram(&format!("Codex turn failed.\n{detail}"))
+                trim_for_telegram(&format!("{provider} turn failed.\n{detail}"))
             }
-            _ => "Codex turn failed.".into(),
+            _ => format!("{provider} turn failed."),
         },
     }
 }

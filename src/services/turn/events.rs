@@ -1,4 +1,4 @@
-//! Per-turn Codex event handling. One named method per `CodexEvent` variant,
+//! Per-turn provider event handling. One named method per `ProviderEvent` variant,
 //! each performing the storage mutation and/or Telegram update for that event.
 //! The handler owns the values the turn loop previously captured in a closure.
 
@@ -8,9 +8,9 @@ use chrono::Utc;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
-    codex::{CodexEvent, CodexPendingApproval, CodexPendingUserInput},
+    provider::{ProviderEvent, ProviderApprovalRequest, ProviderUserInputRequest},
     domain::{
-        ApprovalStatus, CodexThreadId, PendingApproval, PendingPlanFollowUp, PendingUserInput,
+        ApprovalStatus, ThreadId, PendingApproval, PendingPlanFollowUp, PendingUserInput,
         PlanFollowUpId, PlanFollowUpStatus, PromptMode, SessionId, SessionStatus, TelegramChatId,
         UserInputStatus,
     },
@@ -24,7 +24,7 @@ use crate::{
     telegram::{InlineKeyboardMarkup, button},
 };
 
-/// Owns the per-turn context a Codex event handler needs. Storage mutations and
+/// Owns the per-turn context a provider event handler needs. Storage mutations and
 /// Telegram updates are dispatched on background tasks, matching the original
 /// fire-and-forget behavior of the inline turn closure.
 pub(super) struct TurnEventHandler {
@@ -32,39 +32,40 @@ pub(super) struct TurnEventHandler {
     pub session_id: SessionId,
     pub chat_id: TelegramChatId,
     pub mode: PromptMode,
+    pub provider_name: &'static str,
     pub updates_tx: UnboundedSender<TelegramTurnUpdate>,
 }
 
 impl TurnEventHandler {
-    pub fn handle(&self, event: CodexEvent) -> AppResult<()> {
+    pub fn handle(&self, event: ProviderEvent) -> AppResult<()> {
         match event {
-            CodexEvent::ThreadStarted {
+            ProviderEvent::ThreadStarted {
                 thread_id,
                 resume_cursor_json,
             } => self.on_thread_started(thread_id, resume_cursor_json),
-            CodexEvent::Status { text } => self.on_status(text),
-            CodexEvent::Output { text } => self.on_output(text),
-            CodexEvent::CommandStarted { command } => self.on_command_started(command),
-            CodexEvent::CommandFinished {
+            ProviderEvent::Status { text } => self.on_status(text),
+            ProviderEvent::Output { text } => self.on_output(text),
+            ProviderEvent::CommandStarted { command } => self.on_command_started(command),
+            ProviderEvent::CommandFinished {
                 command,
                 exit_code,
                 output,
             } => self.on_command_finished(command, exit_code, output),
-            CodexEvent::ApprovalRequested { approval } => self.on_approval_requested(approval),
-            CodexEvent::UserInputRequested { request } => self.on_user_input_requested(request),
-            CodexEvent::PlanCompleted { markdown } => self.on_plan_completed(markdown),
-            CodexEvent::TurnCompleted => Ok(()),
-            CodexEvent::TurnInterrupted { message } => {
+            ProviderEvent::ApprovalRequested { approval } => self.on_approval_requested(approval),
+            ProviderEvent::UserInputRequested { request } => self.on_user_input_requested(request),
+            ProviderEvent::PlanCompleted { markdown } => self.on_plan_completed(markdown),
+            ProviderEvent::TurnCompleted => Ok(()),
+            ProviderEvent::TurnInterrupted { message } => {
                 let _ = message;
                 Ok(())
             }
-            CodexEvent::TurnFailed { message } => self.on_turn_failed(message),
+            ProviderEvent::TurnFailed { message } => self.on_turn_failed(message),
         }
     }
 
     fn on_thread_started(
         &self,
-        thread_id: CodexThreadId,
+        thread_id: ThreadId,
         resume_cursor_json: Option<String>,
     ) -> AppResult<()> {
         let storage = self.storage.clone();
@@ -109,7 +110,7 @@ impl TurnEventHandler {
         Ok(())
     }
 
-    fn on_approval_requested(&self, approval: CodexPendingApproval) -> AppResult<()> {
+    fn on_approval_requested(&self, approval: ProviderApprovalRequest) -> AppResult<()> {
         let storage = self.storage.clone();
         let session_id = self.session_id.clone();
         let chat_id = self.chat_id;
@@ -149,10 +150,11 @@ impl TurnEventHandler {
         Ok(())
     }
 
-    fn on_user_input_requested(&self, request: CodexPendingUserInput) -> AppResult<()> {
+    fn on_user_input_requested(&self, request: ProviderUserInputRequest) -> AppResult<()> {
         let storage = self.storage.clone();
         let session_id = self.session_id.clone();
         let chat_id = self.chat_id;
+        let provider_name = self.provider_name;
         let updates_tx = self.updates_tx.clone();
         tokio::spawn(async move {
             let _ = storage
@@ -171,7 +173,7 @@ impl TurnEventHandler {
             let _ = storage.insert_pending_user_input(&pending).await;
             if let Ok(markup) = user_input_markup(&pending) {
                 let _ = updates_tx.send(TelegramTurnUpdate::UserInput {
-                    text: render_user_input_prompt(&pending),
+                    text: render_user_input_prompt(provider_name, &pending),
                     markup,
                 });
             }
@@ -215,7 +217,10 @@ impl TurnEventHandler {
     }
 
     fn on_turn_failed(&self, message: String) -> AppResult<()> {
-        send_text_update(&self.updates_tx, format!("Codex turn failed: {message}"));
+        send_text_update(
+            &self.updates_tx,
+            format!("{} turn failed: {message}", self.provider_name),
+        );
         Ok(())
     }
 }

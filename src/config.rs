@@ -14,7 +14,7 @@ use crate::error::{AppError, AppResult};
 #[command(
     name = "atlas2",
     version,
-    about = "Telegram bridge for local Codex sessions"
+    about = "Telegram bridge for local coding-agent sessions"
 )]
 pub struct CliArgs {
     #[command(subcommand)]
@@ -81,6 +81,8 @@ pub struct Config {
     pub database_url: String,
     pub codex_bin: String,
     pub codex_sessions_dir: PathBuf,
+    pub claude_bin: String,
+    pub claude_sessions_dir: PathBuf,
     pub poll_timeout_seconds: u64,
     pub max_directory_entries: usize,
     pub workspace_additional_writable_dirs: Vec<PathBuf>,
@@ -102,6 +104,8 @@ impl Config {
         };
         let codex_bin = env::var("ATLAS2_CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
         let codex_sessions_dir = codex_sessions_dir()?;
+        let claude_bin = env::var("ATLAS2_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+        let claude_sessions_dir = claude_sessions_dir()?;
         let poll_timeout_seconds = env_u64("ATLAS2_POLL_TIMEOUT_SECONDS", 30)?;
         let max_directory_entries = env_usize("ATLAS2_MAX_DIRECTORY_ENTRIES", 20)?;
         let workspace_additional_writable_dirs =
@@ -130,6 +134,8 @@ impl Config {
             database_url,
             codex_bin,
             codex_sessions_dir,
+            claude_bin,
+            claude_sessions_dir,
             poll_timeout_seconds,
             max_directory_entries,
             workspace_additional_writable_dirs: additional_dirs,
@@ -351,6 +357,29 @@ fn codex_sessions_dir() -> AppResult<PathBuf> {
     Ok(codex_home.join("sessions"))
 }
 
+/// Resolves the Claude CLI projects directory, where it records session
+/// transcripts (`~/.claude/projects/**/*.jsonl`). Honors an explicit override,
+/// then `$CLAUDE_CONFIG_DIR/projects`, and finally `~/.claude/projects`.
+fn claude_sessions_dir() -> AppResult<PathBuf> {
+    if let Ok(value) = env::var("ATLAS2_CLAUDE_SESSIONS_DIR")
+        && !value.is_empty()
+    {
+        return Ok(PathBuf::from(value));
+    }
+    let claude_home = match env::var("CLAUDE_CONFIG_DIR") {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        _ => BaseDirs::new()
+            .ok_or_else(|| {
+                AppError::Config(
+                    "could not determine a home directory for the Claude sessions path".into(),
+                )
+            })?
+            .home_dir()
+            .join(".claude"),
+    };
+    Ok(claude_home.join("projects"))
+}
+
 /// Per-user config directory (`~/.config/atlas2` on Linux). Holds credentials
 /// and the dist install receipt.
 pub fn config_dir() -> AppResult<PathBuf> {
@@ -432,7 +461,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        CliSttProvider, Config, ServeArgs, SttProvider, normalize_secret, read_secret_from_file,
+        CliSttProvider, Config, ServeArgs, SttProvider, normalize_secret,
+        read_secret_from_file,
     };
 
     #[test]

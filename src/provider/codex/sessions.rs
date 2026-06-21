@@ -14,36 +14,41 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
 };
 
-use crate::{domain::CodexThreadId, error::AppResult};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CodexMessageRole {
-    User,
-    Assistant,
-}
-
-/// A Codex thread discovered on disk, summarised for the resume picker.
-#[derive(Debug, Clone)]
-pub struct CodexThreadSummary {
-    pub thread_id: CodexThreadId,
-    pub started_at: DateTime<Utc>,
-    /// First real user prompt, single line, for a button label.
-    pub preview: String,
-}
-
-/// A single user/assistant message extracted from a rollout file.
-#[derive(Debug, Clone)]
-pub struct CodexConversationMessage {
-    pub role: CodexMessageRole,
-    pub text: String,
-}
+use crate::{
+    domain::ThreadId,
+    error::AppResult,
+    provider::{ConversationMessage, MessageRole, ThreadHistoryReader, ThreadSummary},
+};
 
 #[derive(Clone)]
-pub struct CodexSessionsReader {
+pub struct CodexThreadReader {
     sessions_dir: PathBuf,
 }
 
-impl CodexSessionsReader {
+#[async_trait::async_trait]
+impl ThreadHistoryReader for CodexThreadReader {
+    async fn list_threads_for_cwd(
+        &self,
+        cwd: &str,
+        limit: usize,
+    ) -> AppResult<Vec<ThreadSummary>> {
+        CodexThreadReader::list_threads_for_cwd(self, cwd, limit).await
+    }
+
+    async fn read_recent_messages(
+        &self,
+        thread_id: &ThreadId,
+        limit: usize,
+    ) -> AppResult<Vec<ConversationMessage>> {
+        CodexThreadReader::read_recent_messages(self, thread_id, limit).await
+    }
+
+    async fn thread_cwd(&self, thread_id: &ThreadId) -> AppResult<Option<String>> {
+        CodexThreadReader::thread_cwd(self, thread_id).await
+    }
+}
+
+impl CodexThreadReader {
     pub fn new(sessions_dir: PathBuf) -> Self {
         Self { sessions_dir }
     }
@@ -55,7 +60,7 @@ impl CodexSessionsReader {
         &self,
         cwd: &str,
         limit: usize,
-    ) -> AppResult<Vec<CodexThreadSummary>> {
+    ) -> AppResult<Vec<ThreadSummary>> {
         let mut summaries = Vec::new();
         for file in self.rollout_files().await? {
             if let Some(summary) = read_thread_summary(&file, cwd).await {
@@ -72,14 +77,14 @@ impl CodexSessionsReader {
     /// filtered out. A missing rollout file yields an empty list.
     pub async fn read_recent_messages(
         &self,
-        thread_id: &CodexThreadId,
+        thread_id: &ThreadId,
         limit: usize,
-    ) -> AppResult<Vec<CodexConversationMessage>> {
+    ) -> AppResult<Vec<ConversationMessage>> {
         let Some(file) = self.locate_thread_file(thread_id).await? else {
             return Ok(Vec::new());
         };
         let content = fs::read_to_string(&file).await?;
-        let mut messages: Vec<CodexConversationMessage> = content
+        let mut messages: Vec<ConversationMessage> = content
             .lines()
             .filter_map(parse_conversation_message)
             .collect();
@@ -91,14 +96,14 @@ impl CodexSessionsReader {
 
     /// Returns the `session_meta` cwd for a thread, if its rollout file exists.
     /// Used to re-validate a thread still belongs to the chat's workspace.
-    pub async fn thread_cwd(&self, thread_id: &CodexThreadId) -> AppResult<Option<String>> {
+    pub async fn thread_cwd(&self, thread_id: &ThreadId) -> AppResult<Option<String>> {
         let Some(file) = self.locate_thread_file(thread_id).await? else {
             return Ok(None);
         };
         Ok(read_session_meta(&file).await.map(|meta| meta.cwd))
     }
 
-    async fn locate_thread_file(&self, thread_id: &CodexThreadId) -> AppResult<Option<PathBuf>> {
+    async fn locate_thread_file(&self, thread_id: &ThreadId) -> AppResult<Option<PathBuf>> {
         // The thread id is also encoded in the rollout filename
         // (`rollout-<ts>-<threadId>.jsonl`), so we can match on the suffix.
         let suffix = format!("-{}.jsonl", thread_id.0);
@@ -140,7 +145,7 @@ impl CodexSessionsReader {
 }
 
 struct SessionMeta {
-    thread_id: CodexThreadId,
+    thread_id: ThreadId,
     cwd: String,
     started_at: DateTime<Utc>,
 }
@@ -155,7 +160,7 @@ async fn read_session_meta(file: &Path) -> Option<SessionMeta> {
 
 /// Reads a thread summary (meta + first real user prompt preview), returning
 /// `None` when the file does not match `cwd` or cannot be parsed.
-async fn read_thread_summary(file: &Path, cwd: &str) -> Option<CodexThreadSummary> {
+async fn read_thread_summary(file: &Path, cwd: &str) -> Option<ThreadSummary> {
     let handle = fs::File::open(file).await.ok()?;
     let mut lines = BufReader::new(handle).lines();
     let first = lines.next_line().await.ok()??;
@@ -167,14 +172,14 @@ async fn read_thread_summary(file: &Path, cwd: &str) -> Option<CodexThreadSummar
     let mut preview = String::new();
     while let Ok(Some(line)) = lines.next_line().await {
         if let Some(message) = parse_conversation_message(&line)
-            && message.role == CodexMessageRole::User
+            && message.role == MessageRole::User
         {
             preview = first_nonempty_line(&message.text);
             break;
         }
     }
 
-    Some(CodexThreadSummary {
+    Some(ThreadSummary {
         thread_id: meta.thread_id,
         started_at: meta.started_at,
         preview,
@@ -193,13 +198,13 @@ fn parse_session_meta(line: &str) -> Option<SessionMeta> {
         .ok()?
         .with_timezone(&Utc);
     Some(SessionMeta {
-        thread_id: CodexThreadId(thread_id),
+        thread_id: ThreadId(thread_id),
         cwd,
         started_at,
     })
 }
 
-fn parse_conversation_message(line: &str) -> Option<CodexConversationMessage> {
+fn parse_conversation_message(line: &str) -> Option<ConversationMessage> {
     let value: Value = serde_json::from_str(line).ok()?;
     if value.get("type")?.as_str()? != "response_item" {
         return None;
@@ -209,18 +214,18 @@ fn parse_conversation_message(line: &str) -> Option<CodexConversationMessage> {
         return None;
     }
     let role = match payload.get("role")?.as_str()? {
-        "user" => CodexMessageRole::User,
-        "assistant" => CodexMessageRole::Assistant,
+        "user" => MessageRole::User,
+        "assistant" => MessageRole::Assistant,
         _ => return None,
     };
     let text = extract_text(payload.get("content")?)?;
     if text.trim().is_empty() {
         return None;
     }
-    if role == CodexMessageRole::User && is_synthetic_user_text(&text) {
+    if role == MessageRole::User && is_synthetic_user_text(&text) {
         return None;
     }
-    Some(CodexConversationMessage { role, text })
+    Some(ConversationMessage { role, text })
 }
 
 fn extract_text(content: &Value) -> Option<String> {
@@ -289,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn lists_only_matching_cwd_newest_first_capped() {
         let temp = tempdir().unwrap();
-        let reader = CodexSessionsReader::new(temp.path().to_path_buf());
+        let reader = CodexThreadReader::new(temp.path().to_path_buf());
 
         write_rollout(
             temp.path(),
@@ -342,7 +347,7 @@ mod tests {
     #[tokio::test]
     async fn preview_skips_synthetic_preamble() {
         let temp = tempdir().unwrap();
-        let reader = CodexSessionsReader::new(temp.path().to_path_buf());
+        let reader = CodexThreadReader::new(temp.path().to_path_buf());
         write_rollout(
             temp.path(),
             "cccccccc-0000-0000-0000-000000000001",
@@ -365,7 +370,7 @@ mod tests {
     #[tokio::test]
     async fn reads_last_messages_filtering_preamble() {
         let temp = tempdir().unwrap();
-        let reader = CodexSessionsReader::new(temp.path().to_path_buf());
+        let reader = CodexThreadReader::new(temp.path().to_path_buf());
         let thread_id = "dddddddd-0000-0000-0000-000000000001";
         let mut lines = vec![meta_line(thread_id, "/work/match", "2026-01-02T10:00:00Z")];
         lines.push(user_line(
@@ -378,15 +383,15 @@ mod tests {
         write_rollout(temp.path(), thread_id, &lines);
 
         let messages = reader
-            .read_recent_messages(&CodexThreadId(thread_id.into()), 10)
+            .read_recent_messages(&ThreadId(thread_id.into()), 10)
             .await
             .unwrap();
 
         // 16 real messages exist; last 10 returned in order, no preamble.
         assert_eq!(messages.len(), 10);
-        assert_eq!(messages.first().unwrap().role, CodexMessageRole::User);
+        assert_eq!(messages.first().unwrap().role, MessageRole::User);
         assert_eq!(messages.first().unwrap().text, "user 3");
-        assert_eq!(messages.last().unwrap().role, CodexMessageRole::Assistant);
+        assert_eq!(messages.last().unwrap().role, MessageRole::Assistant);
         assert_eq!(messages.last().unwrap().text, "assistant 7");
         assert!(messages.iter().all(|m| !m.text.contains("AGENTS.md")));
     }
@@ -394,10 +399,10 @@ mod tests {
     #[tokio::test]
     async fn tolerates_malformed_lines_and_missing_dir() {
         let temp = tempdir().unwrap();
-        let reader = CodexSessionsReader::new(temp.path().join("does-not-exist"));
+        let reader = CodexThreadReader::new(temp.path().join("does-not-exist"));
         assert!(reader.list_threads_for_cwd("/x", 10).await.unwrap().is_empty());
 
-        let reader = CodexSessionsReader::new(temp.path().to_path_buf());
+        let reader = CodexThreadReader::new(temp.path().to_path_buf());
         let thread_id = "eeeeeeee-0000-0000-0000-000000000001";
         write_rollout(
             temp.path(),
@@ -410,7 +415,7 @@ mod tests {
         );
 
         let messages = reader
-            .read_recent_messages(&CodexThreadId(thread_id.into()), 10)
+            .read_recent_messages(&ThreadId(thread_id.into()), 10)
             .await
             .unwrap();
         assert_eq!(messages.len(), 1);
@@ -420,7 +425,7 @@ mod tests {
     #[tokio::test]
     async fn thread_cwd_reads_meta() {
         let temp = tempdir().unwrap();
-        let reader = CodexSessionsReader::new(temp.path().to_path_buf());
+        let reader = CodexThreadReader::new(temp.path().to_path_buf());
         let thread_id = "ffffffff-0000-0000-0000-000000000001";
         write_rollout(
             temp.path(),
@@ -429,13 +434,13 @@ mod tests {
         );
 
         let cwd = reader
-            .thread_cwd(&CodexThreadId(thread_id.into()))
+            .thread_cwd(&ThreadId(thread_id.into()))
             .await
             .unwrap();
         assert_eq!(cwd.as_deref(), Some("/work/match"));
 
         let missing = reader
-            .thread_cwd(&CodexThreadId("00000000-0000-0000-0000-000000000000".into()))
+            .thread_cwd(&ThreadId("00000000-0000-0000-0000-000000000000".into()))
             .await
             .unwrap();
         assert_eq!(missing, None);

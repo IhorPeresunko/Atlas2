@@ -1,14 +1,14 @@
 //! Interactive `request_user_input` flow: button taps and free-text answers,
-//! advancing question-by-question until the full response goes back to Codex.
+//! advancing question-by-question until the full response goes back to the provider.
 
 use crate::{
-    codex::CodexApi,
     domain::{
         PendingUserInput, SessionStatus, TelegramChatId, TelegramUserId, UserInputAnswer,
         UserInputRequestId, UserInputStatus,
     },
     error::{AppError, AppResult},
     presentation::{render_user_input_prompt, render_user_input_summary, user_input_markup},
+    provider::ProviderRegistry,
     storage::Storage,
     telegram::{InlineKeyboardMarkup, TelegramApi},
 };
@@ -36,18 +36,18 @@ enum UserInputAdvance {
 }
 
 #[derive(Clone)]
-pub struct UserInputService<Cx: CodexApi, Tg: TelegramApi> {
+pub struct UserInputService<Tg: TelegramApi> {
     storage: Storage,
     telegram: Tg,
-    codex: Cx,
+    providers: ProviderRegistry,
 }
 
-impl<Cx: CodexApi, Tg: TelegramApi> UserInputService<Cx, Tg> {
-    pub fn new(storage: Storage, telegram: Tg, codex: Cx) -> Self {
+impl<Tg: TelegramApi> UserInputService<Tg> {
+    pub fn new(storage: Storage, telegram: Tg, providers: ProviderRegistry) -> Self {
         Self {
             storage,
             telegram,
-            codex,
+            providers,
         }
     }
 
@@ -169,17 +169,25 @@ impl<Cx: CodexApi, Tg: TelegramApi> UserInputService<Cx, Tg> {
         );
         let answers_json = serde_json::to_string(&request.answers)?;
 
+        let session = self
+            .storage
+            .get_session(&request.session_id)
+            .await?
+            .ok_or_else(|| AppError::Validation("session no longer exists".into()))?;
+        let provider_name = session.provider.display_name();
+
         if request.answers.len() < request.questions.len() {
             self.storage
                 .update_pending_user_input_answers(&request.request_id, &answers_json)
                 .await?;
             return Ok(UserInputAdvance::NextQuestion {
-                text: render_user_input_prompt(&request),
+                text: render_user_input_prompt(provider_name, &request),
                 markup: user_input_markup(&request)?,
             });
         }
 
-        self.codex
+        self.providers
+            .get(session.provider)?
             .resolve_user_input(
                 &request.session_id,
                 &request.request_id,
@@ -199,7 +207,7 @@ impl<Cx: CodexApi, Tg: TelegramApi> UserInputService<Cx, Tg> {
             .await?;
 
         Ok(UserInputAdvance::Completed {
-            summary: render_user_input_summary(&request),
+            summary: render_user_input_summary(provider_name, &request),
         })
     }
 }

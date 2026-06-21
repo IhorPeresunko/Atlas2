@@ -1,6 +1,5 @@
 mod app;
-mod codex;
-mod codex_sessions;
+mod provider;
 mod config;
 mod daemon;
 mod domain;

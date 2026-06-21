@@ -55,26 +55,40 @@ impl PlanFollowUpId {
 pub struct WorkspacePath(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CodexThreadId(pub String);
+pub struct ThreadId(pub String);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionBackend {
-    ExecLegacy,
-    AppServer,
+/// Which coding-agent provider owns a session. Recorded per session so a turn
+/// can be dispatched to the right provider when it is resumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderKind {
+    Codex,
+    Claude,
 }
 
-impl SessionBackend {
+impl ProviderKind {
+    /// All known providers, in display order. Used to offer the `/new` picker
+    /// and to enumerate registered providers.
+    pub const ALL: [ProviderKind; 2] = [ProviderKind::Codex, ProviderKind::Claude];
+
     pub fn as_str(&self) -> &'static str {
         match self {
-            SessionBackend::ExecLegacy => "exec_legacy",
-            SessionBackend::AppServer => "app_server",
+            ProviderKind::Codex => "codex",
+            ProviderKind::Claude => "claude",
+        }
+    }
+
+    /// Human-facing label shown in Telegram status text.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            ProviderKind::Codex => "Codex",
+            ProviderKind::Claude => "Claude",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "exec_legacy" => Some(Self::ExecLegacy),
-            "app_server" => Some(Self::AppServer),
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
             _ => None,
         }
     }
@@ -103,8 +117,8 @@ pub struct SessionRecord {
     pub session_id: SessionId,
     pub chat_id: TelegramChatId,
     pub workspace_path: WorkspacePath,
-    pub backend: SessionBackend,
-    pub provider_thread_id: Option<CodexThreadId>,
+    pub provider: ProviderKind,
+    pub provider_thread_id: Option<ThreadId>,
     pub resume_cursor_json: Option<String>,
     pub status: SessionStatus,
     pub last_error: Option<String>,
@@ -316,9 +330,9 @@ pub struct SessionSummary {
     pub chat_id: TelegramChatId,
     pub chat_title: Option<String>,
     pub workspace_path: WorkspacePath,
-    pub backend: SessionBackend,
+    pub provider: ProviderKind,
     pub status: SessionStatus,
-    pub provider_thread_id: Option<CodexThreadId>,
+    pub provider_thread_id: Option<ThreadId>,
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
 }

@@ -8,8 +8,8 @@ pub enum AppError {
     Config(String),
     #[error("telegram API error: {0}")]
     Telegram(String),
-    #[error("codex execution error: {0}")]
-    Codex(String),
+    #[error("provider error: {0}")]
+    Provider(String),
     #[error("validation error: {0}")]
     Validation(String),
     #[error("storage error: {0}")]

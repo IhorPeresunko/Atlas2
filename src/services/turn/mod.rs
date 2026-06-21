@@ -1,5 +1,5 @@
 //! Turn orchestration: prompt/plan/voice turns, the live-turn registry and
-//! per-chat serialization, and the stop control. The Codex event stream is
+//! per-chat serialization, and the stop control. The provider event stream is
 //! handled by [`events::TurnEventHandler`].
 
 use std::{collections::HashMap, sync::Arc};
@@ -7,12 +7,9 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, OwnedMutexGuard, mpsc::unbounded_channel};
 
 use crate::{
-    codex::CodexApi,
-    domain::{
-        PromptMode, SessionBackend, SessionId, SessionRecord, SessionStatus, TelegramChatId,
-        TelegramUserId,
-    },
+    domain::{PromptMode, SessionId, SessionRecord, SessionStatus, TelegramChatId, TelegramUserId},
     error::{AppError, AppResult},
+    provider::ProviderRegistry,
     presentation::{
         TelegramTurnDeliveryState, TurnTerminalState, render_turn_terminal_text,
         render_voice_transcript_message, send_clear_status_update, send_status_update,
@@ -37,28 +34,28 @@ struct LiveTurnControl {
 }
 
 #[derive(Clone)]
-pub struct TurnService<Cx: CodexApi, Tg: TelegramApi> {
+pub struct TurnService<Tg: TelegramApi> {
     storage: Storage,
     telegram: Tg,
-    codex: Cx,
+    providers: ProviderRegistry,
     stt: SttClient,
-    model: ModelService<Cx>,
+    model: ModelService,
     session_locks: Arc<Mutex<HashMap<i64, Arc<Mutex<()>>>>>,
     live_turns: Arc<Mutex<HashMap<SessionId, LiveTurnControl>>>,
 }
 
-impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> TurnService<Cx, Tg> {
+impl<Tg: TelegramApi + 'static> TurnService<Tg> {
     pub fn new(
         storage: Storage,
         telegram: Tg,
-        codex: Cx,
+        providers: ProviderRegistry,
         stt: SttClient,
-        model: ModelService<Cx>,
+        model: ModelService,
     ) -> Self {
         Self {
             storage,
             telegram,
-            codex,
+            providers,
             stt,
             model,
             session_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -107,7 +104,12 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> TurnService<Cx, Tg> {
             live_turn.stop_requested = true;
         }
 
-        if let Err(error) = self.codex.stop_turn(&session_id).await {
+        if let Err(error) = self
+            .providers
+            .get(session.provider)?
+            .stop_turn(&session_id)
+            .await
+        {
             let mut live_turns = self.live_turns.lock().await;
             if let Some(live_turn) = live_turns.get_mut(&session_id) {
                 live_turn.stop_requested = false;
@@ -122,7 +124,10 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> TurnService<Cx, Tg> {
             .expire_pending_user_inputs_for_session(&session_id)
             .await?;
 
-        Ok("Stopping Codex turn.".into())
+        Ok(format!(
+            "Stopping {} turn.",
+            session.provider.display_name()
+        ))
     }
 
     /// Best-effort cancellation of whatever turn is currently running in a chat.
@@ -146,7 +151,11 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> TurnService<Cx, Tg> {
                 None => return,
             }
         };
-        let _ = self.codex.stop_turn(&session_id).await;
+        if let Ok(Some(session)) = self.storage.get_session(&session_id).await
+            && let Ok(provider) = self.providers.get(session.provider)
+        {
+            let _ = provider.stop_turn(&session_id).await;
+        }
         let _ = self
             .storage
             .expire_pending_approvals_for_session(&session_id)
@@ -213,12 +222,12 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> TurnService<Cx, Tg> {
             .map(|chat| (chat.model, chat.reasoning_effort))
             .unwrap_or((None, None));
         let session = self.require_active_session(chat_id).await?;
-        // The Codex app-server rejects a turn without a model. Resolve and
+        // Some providers (e.g. Codex) reject a turn without a model. Resolve and
         // persist its default when the chat has none (e.g. a brand-new chat).
         if model.is_none() {
             model = self
                 .model
-                .ensure_chat_model(chat_id, &session.workspace_path.0)
+                .ensure_chat_model(chat_id, session.provider, &session.workspace_path.0)
                 .await?;
         }
         tracing::info!(
@@ -227,14 +236,10 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> TurnService<Cx, Tg> {
             mode = ?mode,
             workspace_path = session.workspace_path.0,
             prompt_chars = prompt.chars().count(),
-            "starting Codex prompt"
+            "starting provider prompt"
         );
-        if session.backend != SessionBackend::AppServer {
-            return Err(AppError::Validation(
-                "this session was created before the app-server migration and cannot continue; run /new to start a fresh session".into(),
-            ));
-        }
 
+        let provider_name = session.provider.display_name();
         self.storage
             .update_session_status(&session.session_id, SessionStatus::Running, None)
             .await?;
@@ -242,7 +247,7 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> TurnService<Cx, Tg> {
             .telegram
             .send_message(
                 chat_id,
-                "Codex turn running.",
+                &format!("{provider_name} turn running."),
                 None,
                 Some(turn_control_markup(&session.session_id)),
             )
@@ -266,17 +271,22 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> TurnService<Cx, Tg> {
             }
         });
 
-        send_status_update(&telegram_updates_tx, "Starting Codex turn...");
+        send_status_update(
+            &telegram_updates_tx,
+            format!("Starting {provider_name} turn..."),
+        );
         let handler = TurnEventHandler {
             storage: self.storage.clone(),
             session_id: session.session_id.clone(),
             chat_id,
             mode,
+            provider_name,
             updates_tx: telegram_updates_tx.clone(),
         };
 
         let result = self
-            .codex
+            .providers
+            .get(session.provider)?
             .run_turn(
                 &session,
                 prompt,
@@ -314,7 +324,12 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> TurnService<Cx, Tg> {
                 };
                 if let Some(live_turn) = live_turn {
                     if let Err(error) = self
-                        .finish_turn_control(live_turn, terminal_state, result.failure.as_deref())
+                        .finish_turn_control(
+                            provider_name,
+                            live_turn,
+                            terminal_state,
+                            result.failure.as_deref(),
+                        )
                         .await
                     {
                         tracing::warn!(
@@ -366,6 +381,7 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> TurnService<Cx, Tg> {
                 if let Some(live_turn) = live_turn {
                     let _ = self
                         .finish_turn_control(
+                            provider_name,
                             live_turn,
                             TurnTerminalState::Failed,
                             Some(&error.to_string()),
@@ -412,6 +428,7 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> TurnService<Cx, Tg> {
 
     async fn finish_turn_control(
         &self,
+        provider_name: &str,
         live_turn: LiveTurnControl,
         state: TurnTerminalState,
         detail: Option<&str>,
@@ -420,7 +437,7 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> TurnService<Cx, Tg> {
             .edit_message_text(
                 live_turn.chat_id,
                 live_turn.control_message_id,
-                &render_turn_terminal_text(state, detail),
+                &render_turn_terminal_text(provider_name, state, detail),
                 None,
                 None,
             )

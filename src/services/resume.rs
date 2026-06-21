@@ -1,14 +1,15 @@
-//! Resuming an existing Codex thread for a chat's active session.
+//! Resuming an existing provider thread for a chat's active session.
 //!
-//! `/new` always starts a fresh Codex thread; this service instead attaches the
-//! chat's active session to a thread that already exists on disk (started here
-//! or via the laptop Codex CLI, which share `~/.codex/sessions`).
+//! `/new` always starts a fresh thread; this service instead attaches the chat's
+//! active session to a thread that already exists on disk (started here or via
+//! the laptop CLI, which share the provider's session directory). The thread
+//! history is read from the reader matching the session's provider.
 
 use crate::{
-    codex_sessions::CodexSessionsReader,
-    domain::{CodexThreadId, TelegramChatId, TelegramUserId},
+    domain::{TelegramChatId, TelegramUserId, ThreadId},
     error::{AppError, AppResult},
     presentation::{render_resume_prompt, render_resume_transcript, resume_threads_markup},
+    provider::ThreadReaderRegistry,
     storage::Storage,
     telegram::{InlineKeyboardMarkup, TelegramApi},
 };
@@ -27,21 +28,21 @@ pub struct ResumeCallbackResult {
 pub struct ResumeService<Tg: TelegramApi> {
     storage: Storage,
     telegram: Tg,
-    reader: CodexSessionsReader,
+    readers: ThreadReaderRegistry,
 }
 
 impl<Tg: TelegramApi> ResumeService<Tg> {
-    pub fn new(storage: Storage, telegram: Tg, reader: CodexSessionsReader) -> Self {
+    pub fn new(storage: Storage, telegram: Tg, readers: ThreadReaderRegistry) -> Self {
         Self {
             storage,
             telegram,
-            reader,
+            readers,
         }
     }
 
-    /// Lists the recent Codex threads sharing the active session's workspace.
-    /// Returns instructive text (and no markup) when there is no active session
-    /// or no matching threads.
+    /// Lists the recent threads sharing the active session's workspace, read from
+    /// the active session's provider. Returns instructive text (and no markup)
+    /// when there is no active session or no matching threads.
     pub async fn begin_resume(
         &self,
         chat_id: TelegramChatId,
@@ -55,11 +56,12 @@ impl<Tg: TelegramApi> ResumeService<Tg> {
         let workspace = session.workspace_path.0;
 
         let threads = self
-            .reader
+            .readers
+            .get(session.provider)?
             .list_threads_for_cwd(&workspace, RESUME_THREAD_LIMIT)
             .await?;
         if threads.is_empty() {
-            return Ok((format!("No Codex threads found for `{workspace}`."), None));
+            return Ok((format!("No threads found for `{workspace}`."), None));
         }
 
         Ok((
@@ -85,18 +87,18 @@ impl<Tg: TelegramApi> ResumeService<Tg> {
             .ok_or_else(|| {
                 AppError::Validation("no active session for this chat; run /new first".into())
             })?;
-        let thread_id = CodexThreadId(thread_id_raw.to_string());
+        let thread_id = ThreadId(thread_id_raw.to_string());
+        let reader = self.readers.get(session.provider)?;
 
         // Re-validate the picked thread still belongs to this workspace; guards
         // against a stale picker after the active session changed.
-        let thread_cwd = self
-            .reader
+        let thread_cwd = reader
             .thread_cwd(&thread_id)
             .await?
-            .ok_or_else(|| AppError::Validation("that Codex thread no longer exists".into()))?;
+            .ok_or_else(|| AppError::Validation("that thread no longer exists".into()))?;
         if thread_cwd != session.workspace_path.0 {
             return Err(AppError::Validation(
-                "that Codex thread belongs to a different workspace".into(),
+                "that thread belongs to a different workspace".into(),
             ));
         }
 
@@ -106,14 +108,13 @@ impl<Tg: TelegramApi> ResumeService<Tg> {
             .update_session_provider_state(&session.session_id, Some(&thread_id), None)
             .await?;
 
-        let messages = self
-            .reader
+        let messages = reader
             .read_recent_messages(&thread_id, RESUME_TRANSCRIPT_MESSAGES)
             .await?;
 
         Ok(ResumeCallbackResult {
             confirmation: format!(
-                "Resumed Codex thread in `{}`.\nSend a prompt to continue.",
+                "Resumed thread in `{}`.\nSend a prompt to continue.",
                 session.workspace_path.0
             ),
             transcript: render_resume_transcript(&messages),
@@ -124,12 +125,26 @@ impl<Tg: TelegramApi> ResumeService<Tg> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{SessionBackend, SessionId, SessionRecord, SessionStatus, WorkspacePath};
+    use crate::domain::{ProviderKind, SessionId, SessionRecord, SessionStatus, WorkspacePath};
+    use crate::provider::CodexThreadReader;
     use crate::telegram::TelegramClient;
     use chrono::Utc;
+    use std::collections::HashMap;
     use std::fs as std_fs;
     use std::path::Path;
+    use std::sync::Arc;
     use tempfile::tempdir;
+
+    /// A reader registry serving the given Codex reader for the Codex kind (the
+    /// kind the resume tests seed).
+    fn codex_readers(reader: CodexThreadReader) -> ThreadReaderRegistry {
+        let mut readers = HashMap::new();
+        readers.insert(
+            ProviderKind::Codex,
+            Arc::new(reader) as Arc<dyn crate::provider::ThreadHistoryReader>,
+        );
+        ThreadReaderRegistry::new(readers)
+    }
 
     fn write_thread(dir: &Path, thread_id: &str, cwd: &str) {
         let day = dir.join("2026").join("01").join("02");
@@ -156,7 +171,7 @@ mod tests {
                 session_id: session_id.clone(),
                 chat_id,
                 workspace_path: WorkspacePath(workspace.to_string()),
-                backend: SessionBackend::AppServer,
+                provider: ProviderKind::Codex,
                 provider_thread_id: None,
                 resume_cursor_json: None,
                 status: SessionStatus::Ready,
@@ -184,7 +199,7 @@ mod tests {
         let service = ResumeService::new(
             storage,
             TelegramClient::new("http://127.0.0.1:9", "token"),
-            CodexSessionsReader::new(temp.path().to_path_buf()),
+            codex_readers(CodexThreadReader::new(temp.path().to_path_buf())),
         );
 
         let (text, markup) = service.begin_resume(chat_id).await.unwrap();
@@ -204,11 +219,11 @@ mod tests {
         let service = ResumeService::new(
             storage,
             TelegramClient::new("http://127.0.0.1:9", "token"),
-            CodexSessionsReader::new(temp.path().to_path_buf()),
+            codex_readers(CodexThreadReader::new(temp.path().to_path_buf())),
         );
 
         let (text, markup) = service.begin_resume(chat_id).await.unwrap();
-        assert!(text.contains("Pick a Codex thread"));
+        assert!(text.contains("Pick a thread"));
         let markup = markup.expect("markup present");
         assert_eq!(markup.inline_keyboard.len(), 1);
         assert!(
@@ -229,11 +244,11 @@ mod tests {
         let service = ResumeService::new(
             storage,
             TelegramClient::new("http://127.0.0.1:9", "token"),
-            CodexSessionsReader::new(temp.path().to_path_buf()),
+            codex_readers(CodexThreadReader::new(temp.path().to_path_buf())),
         );
 
         let (text, markup) = service.begin_resume(chat_id).await.unwrap();
-        assert!(text.contains("No Codex threads found"));
+        assert!(text.contains("No threads found"));
         assert!(markup.is_none());
     }
 }

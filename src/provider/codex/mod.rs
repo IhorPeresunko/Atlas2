@@ -18,11 +18,19 @@ use tokio::{
 
 use crate::{
     domain::{
-        ApprovalId, CodexThreadId, PromptMode, SessionId, SessionRecord, UserInputAnswer,
+        ApprovalId, PromptMode, SessionId, SessionRecord, ThreadId, UserInputAnswer,
         UserInputQuestion, UserInputRequestId,
     },
     error::{AppError, AppResult},
+    provider::{
+        ModelOption, Provider, ProviderApprovalRequest, ProviderEvent, ProviderUserInputRequest,
+        ReasoningEffortOption, TurnResult,
+    },
 };
+
+mod sessions;
+
+pub use sessions::CodexThreadReader;
 
 const STALE_THREAD_RECOVERY_MESSAGE: &str = "Stored Codex conversation could not be resumed; Atlas2 started a fresh thread without prior conversation context.";
 const CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS: &str = concat!(
@@ -48,13 +56,13 @@ const CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS: &str = concat!(
 );
 
 #[derive(Debug, Clone)]
-pub struct CodexClient {
+pub struct CodexProvider {
     codex_bin: String,
     additional_dirs: Vec<PathBuf>,
     runtimes: Arc<Mutex<HashMap<SessionId, Arc<LiveRuntimeHandle>>>>,
 }
 
-impl CodexClient {
+impl CodexProvider {
     pub fn new(codex_bin: String, additional_dirs: Vec<PathBuf>) -> Self {
         Self {
             codex_bin,
@@ -71,9 +79,9 @@ impl CodexClient {
         model: Option<&str>,
         reasoning_effort: Option<&str>,
         mut on_event: F,
-    ) -> AppResult<CodexTurnResult>
+    ) -> AppResult<TurnResult>
     where
-        F: FnMut(CodexEvent) -> AppResult<()>,
+        F: FnMut(ProviderEvent) -> AppResult<()>,
     {
         let mut resume_thread_id = session.provider_thread_id.clone();
         let mut retry_with_fresh_thread_available = session.provider_thread_id.is_some();
@@ -103,18 +111,18 @@ impl CodexClient {
                     .await?;
 
                 if let Some(message) = opened_thread.recovery_message.as_ref() {
-                    on_event(CodexEvent::Status {
+                    on_event(ProviderEvent::Status {
                         text: message.clone(),
                     })?;
                 }
 
-                let mut result = CodexTurnResult {
+                let mut result = TurnResult {
                     thread_id: opened_thread.thread_id.clone(),
                     resume_cursor_json: opened_thread.resume_cursor_json.clone(),
-                    ..CodexTurnResult::default()
+                    ..TurnResult::default()
                 };
                 if let Some(thread_id) = opened_thread.thread_id {
-                    on_event(CodexEvent::ThreadStarted {
+                    on_event(ProviderEvent::ThreadStarted {
                         thread_id,
                         resume_cursor_json: opened_thread.resume_cursor_json,
                     })?;
@@ -126,7 +134,7 @@ impl CodexClient {
                         retry_with_fresh_thread_available,
                         &error,
                     ) {
-                        on_event(CodexEvent::Status {
+                        on_event(ProviderEvent::Status {
                             text: STALE_THREAD_RECOVERY_MESSAGE.into(),
                         })?;
                         return Ok(CodexRunOutcome::RetryFreshThread);
@@ -138,19 +146,19 @@ impl CodexClient {
 
                 loop {
                     let Some(event) = runtime.next_event().await? else {
-                        return Err(AppError::Codex(
+                        return Err(AppError::Provider(
                             "codex app-server exited before the turn completed".into(),
                         ));
                     };
 
-                    if let CodexEvent::TurnFailed { message } = &event {
+                    if let ProviderEvent::TurnFailed { message } = &event {
                         if should_retry_with_fresh_thread_after_failure(
                             resume_thread_id.as_ref(),
                             retry_with_fresh_thread_available,
                             message,
                             saw_material_turn_activity,
                         ) {
-                            on_event(CodexEvent::Status {
+                            on_event(ProviderEvent::Status {
                                 text: STALE_THREAD_RECOVERY_MESSAGE.into(),
                             })?;
                             return Ok(CodexRunOutcome::RetryFreshThread);
@@ -158,31 +166,31 @@ impl CodexClient {
                     }
 
                     match &event {
-                        CodexEvent::ThreadStarted {
+                        ProviderEvent::ThreadStarted {
                             thread_id,
                             resume_cursor_json,
                         } => {
                             result.thread_id = Some(thread_id.clone());
                             result.resume_cursor_json = resume_cursor_json.clone();
                         }
-                        CodexEvent::Output { .. }
-                        | CodexEvent::CommandStarted { .. }
-                        | CodexEvent::CommandFinished { .. }
-                        | CodexEvent::ApprovalRequested { .. }
-                        | CodexEvent::UserInputRequested { .. }
-                        | CodexEvent::PlanCompleted { .. } => {
+                        ProviderEvent::Output { .. }
+                        | ProviderEvent::CommandStarted { .. }
+                        | ProviderEvent::CommandFinished { .. }
+                        | ProviderEvent::ApprovalRequested { .. }
+                        | ProviderEvent::UserInputRequested { .. }
+                        | ProviderEvent::PlanCompleted { .. } => {
                             saw_material_turn_activity = true;
                         }
-                        CodexEvent::TurnCompleted => {
+                        ProviderEvent::TurnCompleted => {
                             result.completed = true;
                         }
-                        CodexEvent::TurnInterrupted { .. } => {
+                        ProviderEvent::TurnInterrupted { .. } => {
                             result.interrupted = true;
                         }
-                        CodexEvent::TurnFailed { message } => {
+                        ProviderEvent::TurnFailed { message } => {
                             result.failure = Some(message.clone());
                         }
-                        CodexEvent::Status { .. } => {}
+                        ProviderEvent::Status { .. } => {}
                     }
 
                     on_event(event.clone())?;
@@ -357,45 +365,10 @@ impl CodexClient {
     }
 }
 
-/// Seam over the Codex app-server adapter so business logic in `services` can be
-/// exercised against a fake without spawning a real `codex` process. The boxed
-/// callback (rather than a generic closure) keeps the trait object-friendly and
-/// lets the async future stay `Send`.
 #[async_trait::async_trait]
-pub(crate) trait CodexApi: Clone + Send + Sync {
-    async fn list_models(&self, workspace_path: &str) -> AppResult<Vec<ModelOption>>;
-
-    async fn run_turn(
-        &self,
-        session: &SessionRecord,
-        prompt: &str,
-        mode: PromptMode,
-        model: Option<&str>,
-        reasoning_effort: Option<&str>,
-        on_event: Box<dyn FnMut(CodexEvent) -> AppResult<()> + Send>,
-    ) -> AppResult<CodexTurnResult>;
-
-    async fn resolve_approval(
-        &self,
-        session_id: &SessionId,
-        approval_id: &ApprovalId,
-        approved: bool,
-    ) -> AppResult<()>;
-
-    async fn resolve_user_input(
-        &self,
-        session_id: &SessionId,
-        request_id: &UserInputRequestId,
-        answers: HashMap<String, UserInputAnswer>,
-    ) -> AppResult<()>;
-
-    async fn stop_turn(&self, session_id: &SessionId) -> AppResult<()>;
-}
-
-#[async_trait::async_trait]
-impl CodexApi for CodexClient {
+impl Provider for CodexProvider {
     async fn list_models(&self, workspace_path: &str) -> AppResult<Vec<ModelOption>> {
-        CodexClient::list_models(self, workspace_path).await
+        CodexProvider::list_models(self, workspace_path).await
     }
 
     async fn run_turn(
@@ -405,9 +378,9 @@ impl CodexApi for CodexClient {
         mode: PromptMode,
         model: Option<&str>,
         reasoning_effort: Option<&str>,
-        on_event: Box<dyn FnMut(CodexEvent) -> AppResult<()> + Send>,
-    ) -> AppResult<CodexTurnResult> {
-        CodexClient::run_turn(
+        on_event: Box<dyn FnMut(ProviderEvent) -> AppResult<()> + Send>,
+    ) -> AppResult<TurnResult> {
+        CodexProvider::run_turn(
             self,
             session,
             prompt,
@@ -425,7 +398,7 @@ impl CodexApi for CodexClient {
         approval_id: &ApprovalId,
         approved: bool,
     ) -> AppResult<()> {
-        CodexClient::resolve_approval(self, session_id, approval_id, approved).await
+        CodexProvider::resolve_approval(self, session_id, approval_id, approved).await
     }
 
     async fn resolve_user_input(
@@ -434,82 +407,22 @@ impl CodexApi for CodexClient {
         request_id: &UserInputRequestId,
         answers: HashMap<String, UserInputAnswer>,
     ) -> AppResult<()> {
-        CodexClient::resolve_user_input(self, session_id, request_id, answers).await
+        CodexProvider::resolve_user_input(self, session_id, request_id, answers).await
     }
 
     async fn stop_turn(&self, session_id: &SessionId) -> AppResult<()> {
-        CodexClient::stop_turn(self, session_id).await
+        CodexProvider::stop_turn(self, session_id).await
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct CodexTurnResult {
-    pub thread_id: Option<CodexThreadId>,
-    pub resume_cursor_json: Option<String>,
-    pub completed: bool,
-    pub interrupted: bool,
-    pub failure: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub enum CodexEvent {
-    ThreadStarted {
-        thread_id: CodexThreadId,
-        resume_cursor_json: Option<String>,
-    },
-    Status {
-        text: String,
-    },
-    Output {
-        text: String,
-    },
-    CommandStarted {
-        command: String,
-    },
-    CommandFinished {
-        command: String,
-        exit_code: i64,
-        output: String,
-    },
-    ApprovalRequested {
-        approval: CodexPendingApproval,
-    },
-    UserInputRequested {
-        request: CodexPendingUserInput,
-    },
-    PlanCompleted {
-        markdown: String,
-    },
-    TurnCompleted,
-    TurnInterrupted {
-        message: String,
-    },
-    TurnFailed {
-        message: String,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct CodexPendingApproval {
-    pub approval_id: ApprovalId,
-    pub summary: String,
-    pub payload: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct CodexPendingUserInput {
-    pub request_id: UserInputRequestId,
-    pub questions: Vec<UserInputQuestion>,
-}
-
 enum CodexRunOutcome {
-    Finished(CodexTurnResult),
+    Finished(TurnResult),
     RetryFreshThread,
 }
 
 #[derive(Debug, Clone)]
 struct ThreadOpenState {
-    thread_id: Option<CodexThreadId>,
+    thread_id: Option<ThreadId>,
     resume_cursor_json: Option<String>,
     recovery_message: Option<String>,
 }
@@ -517,7 +430,7 @@ struct ThreadOpenState {
 struct AppServerRuntime {
     child: Child,
     sender: mpsc::UnboundedSender<String>,
-    receiver: mpsc::UnboundedReceiver<CodexEvent>,
+    receiver: mpsc::UnboundedReceiver<ProviderEvent>,
     response_waiters: Arc<Mutex<HashMap<u64, oneshot::Sender<AppResult<Value>>>>>,
     handle: Arc<LiveRuntimeHandle>,
     next_request_id: u64,
@@ -527,30 +440,6 @@ struct AppServerRuntime {
     workspace_path: String,
     model: Option<String>,
     reasoning_effort: Option<String>,
-}
-
-/// A model entry as reported by Codex core via the `model/list` request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelOption {
-    /// Slug forwarded back to Codex (e.g. `gpt-5.5`).
-    pub model: String,
-    /// Human-friendly label for the Telegram picker.
-    pub display_name: String,
-    /// Whether Codex considers this its default model.
-    pub is_default: bool,
-    /// Reasoning effort Codex applies for this model when none is chosen.
-    pub default_reasoning_effort: Option<String>,
-    /// Reasoning efforts this model accepts, in the order Codex advertises them.
-    pub supported_reasoning_efforts: Vec<ReasoningEffortOption>,
-}
-
-/// A reasoning effort level advertised by a model (e.g. `low`, `high`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReasoningEffortOption {
-    /// Slug forwarded back to Codex (e.g. `high`).
-    pub effort: String,
-    /// Human-friendly description for the Telegram picker.
-    pub description: String,
 }
 
 impl AppServerRuntime {
@@ -574,15 +463,15 @@ impl AppServerRuntime {
         let stdin = child
             .stdin
             .take()
-            .ok_or_else(|| AppError::Codex("missing stdin from codex app-server".into()))?;
+            .ok_or_else(|| AppError::Provider("missing stdin from codex app-server".into()))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| AppError::Codex("missing stdout from codex app-server".into()))?;
+            .ok_or_else(|| AppError::Provider("missing stdout from codex app-server".into()))?;
         let stderr = child
             .stderr
             .take()
-            .ok_or_else(|| AppError::Codex("missing stderr from codex app-server".into()))?;
+            .ok_or_else(|| AppError::Provider("missing stderr from codex app-server".into()))?;
 
         let (sender, mut write_rx) = mpsc::unbounded_channel::<String>();
         let writer_task = tokio::spawn(async move {
@@ -600,7 +489,7 @@ impl AppServerRuntime {
             }
         });
 
-        let (event_tx, receiver) = mpsc::unbounded_channel::<CodexEvent>();
+        let (event_tx, receiver) = mpsc::unbounded_channel::<ProviderEvent>();
         let response_waiters = Arc::new(Mutex::new(HashMap::<
             u64,
             oneshot::Sender<AppResult<Value>>,
@@ -673,7 +562,7 @@ impl AppServerRuntime {
 
     async fn open_thread(
         &mut self,
-        provider_thread_id: Option<&CodexThreadId>,
+        provider_thread_id: Option<&ThreadId>,
         _resume_cursor_json: Option<&str>,
     ) -> AppResult<ThreadOpenState> {
         let params = json!({
@@ -719,7 +608,7 @@ impl AppServerRuntime {
     async fn start_turn(&mut self, prompt: &str, mode: PromptMode) -> AppResult<()> {
         let thread_id =
             self.handle.latest_thread_id().await.ok_or_else(|| {
-                AppError::Codex("missing provider thread id for turn start".into())
+                AppError::Provider("missing provider thread id for turn start".into())
             })?;
 
         let turn_prompt = build_codex_prompt(prompt, mode);
@@ -748,7 +637,7 @@ impl AppServerRuntime {
         Ok(())
     }
 
-    async fn next_event(&mut self) -> AppResult<Option<CodexEvent>> {
+    async fn next_event(&mut self) -> AppResult<Option<ProviderEvent>> {
         tokio::select! {
             event = self.receiver.recv() => Ok(event),
             status = self.child.wait() => {
@@ -756,7 +645,7 @@ impl AppServerRuntime {
                 if status.success() {
                     Ok(None)
                 } else {
-                    Err(AppError::Codex(format!("codex app-server exited with status {status}")))
+                    Err(AppError::Provider(format!("codex app-server exited with status {status}")))
                 }
             }
         }
@@ -787,10 +676,10 @@ impl AppServerRuntime {
                 })
                 .to_string(),
             )
-            .map_err(|_| AppError::Codex(format!("failed to send app-server request {method}")))?;
+            .map_err(|_| AppError::Provider(format!("failed to send app-server request {method}")))?;
 
         rx.await.map_err(|_| {
-            AppError::Codex(format!(
+            AppError::Provider(format!(
                 "app-server response channel closed while waiting for {method}"
             ))
         })?
@@ -806,7 +695,7 @@ impl AppServerRuntime {
                 .to_string(),
             )
             .map_err(|_| {
-                AppError::Codex(format!("failed to send app-server notification {method}"))
+                AppError::Provider(format!("failed to send app-server notification {method}"))
             })
     }
 }
@@ -817,7 +706,7 @@ struct LiveRuntimeHandle {
     user_inputs: Arc<Mutex<HashMap<UserInputRequestId, PendingUserInputRequest>>>,
     sender: mpsc::UnboundedSender<String>,
     session_id: SessionId,
-    current_thread_id: Mutex<Option<CodexThreadId>>,
+    current_thread_id: Mutex<Option<ThreadId>>,
     current_turn_id: Mutex<Option<String>>,
     next_request_id: AtomicU64,
 }
@@ -842,7 +731,7 @@ impl LiveRuntimeHandle {
                 .to_string(),
             )
             .map_err(|_| {
-                AppError::Codex(format!(
+                AppError::Provider(format!(
                     "failed to send approval decision for session {}",
                     self.session_id.0
                 ))
@@ -871,18 +760,18 @@ impl LiveRuntimeHandle {
                 .to_string(),
             )
             .map_err(|_| {
-                AppError::Codex(format!(
+                AppError::Provider(format!(
                     "failed to send user input response for session {}",
                     self.session_id.0
                 ))
             })
     }
 
-    async fn latest_thread_id(&self) -> Option<CodexThreadId> {
+    async fn latest_thread_id(&self) -> Option<ThreadId> {
         self.current_thread_id.lock().await.clone()
     }
 
-    async fn set_thread_id(&self, thread_id: Option<CodexThreadId>) {
+    async fn set_thread_id(&self, thread_id: Option<ThreadId>) {
         *self.current_thread_id.lock().await = thread_id;
     }
 
@@ -915,7 +804,7 @@ impl LiveRuntimeHandle {
                 .to_string(),
             )
             .map_err(|_| {
-                AppError::Codex(format!(
+                AppError::Provider(format!(
                     "failed to interrupt Codex turn for session {}",
                     self.session_id.0
                 ))
@@ -940,7 +829,7 @@ struct ToolRequestUserInputParams {
 
 async fn read_stdout_loop(
     reader: BufReader<tokio::process::ChildStdout>,
-    event_tx: mpsc::UnboundedSender<CodexEvent>,
+    event_tx: mpsc::UnboundedSender<ProviderEvent>,
     response_waiters: Arc<Mutex<HashMap<u64, oneshot::Sender<AppResult<Value>>>>>,
     command_outputs: Arc<Mutex<HashMap<String, String>>>,
     handle: Arc<LiveRuntimeHandle>,
@@ -953,7 +842,7 @@ async fn read_stdout_loop(
         }
 
         let Ok(json) = serde_json::from_str::<Value>(&line) else {
-            let _ = event_tx.send(CodexEvent::Status {
+            let _ = event_tx.send(ProviderEvent::Status {
                 text: format!("invalid app-server JSON: {line}"),
             });
             continue;
@@ -974,15 +863,15 @@ async fn read_stdout_loop(
                 map_notification(&method, &params, &command_outputs, &text_outputs).await
             {
                 match &event {
-                    CodexEvent::ThreadStarted { thread_id, .. } => {
+                    ProviderEvent::ThreadStarted { thread_id, .. } => {
                         handle.set_thread_id(Some(thread_id.clone())).await;
                     }
-                    CodexEvent::Status { .. } if method == "turn/started" => {
+                    ProviderEvent::Status { .. } if method == "turn/started" => {
                         handle.set_turn_id(extract_turn_id(&params)).await;
                     }
-                    CodexEvent::TurnCompleted
-                    | CodexEvent::TurnInterrupted { .. }
-                    | CodexEvent::TurnFailed { .. } => {
+                    ProviderEvent::TurnCompleted
+                    | ProviderEvent::TurnInterrupted { .. }
+                    | ProviderEvent::TurnFailed { .. } => {
                         handle.set_turn_id(None).await;
                     }
                     _ => {}
@@ -994,7 +883,7 @@ async fn read_stdout_loop(
 
     let mut waiters = response_waiters.lock().await;
     for (_id, sender) in waiters.drain() {
-        let _ = sender.send(Err(AppError::Codex(
+        let _ = sender.send(Err(AppError::Provider(
             "codex app-server closed stdout before replying".into(),
         )));
     }
@@ -1026,7 +915,7 @@ async fn handle_response(
                 .and_then(Value::as_str)
                 .unwrap_or("unknown app-server error")
                 .to_string();
-            let _ = sender.send(Err(AppError::Codex(message)));
+            let _ = sender.send(Err(AppError::Provider(message)));
         } else {
             let _ = sender.send(Ok(json.get("result").cloned().unwrap_or(Value::Null)));
         }
@@ -1056,7 +945,7 @@ async fn handle_server_request(
     request_id: Value,
     method: &str,
     params: Value,
-    event_tx: &mpsc::UnboundedSender<CodexEvent>,
+    event_tx: &mpsc::UnboundedSender<ProviderEvent>,
     handle: &Arc<LiveRuntimeHandle>,
 ) -> bool {
     match method {
@@ -1070,8 +959,8 @@ async fn handle_server_request(
                     request_id: request_id.clone(),
                 },
             );
-            let _ = event_tx.send(CodexEvent::ApprovalRequested {
-                approval: CodexPendingApproval {
+            let _ = event_tx.send(ProviderEvent::ApprovalRequested {
+                approval: ProviderApprovalRequest {
                     approval_id,
                     summary: summarize_approval_request(method, &params),
                     payload: params.to_string(),
@@ -1083,7 +972,7 @@ async fn handle_server_request(
             let parsed = match serde_json::from_value::<ToolRequestUserInputParams>(params) {
                 Ok(parsed) => parsed,
                 Err(error) => {
-                    let _ = event_tx.send(CodexEvent::Status {
+                    let _ = event_tx.send(ProviderEvent::Status {
                         text: format!(
                             "Codex sent an invalid interactive user input request: {error}"
                         ),
@@ -1103,7 +992,7 @@ async fn handle_server_request(
             };
 
             if !supports_telegram_user_input_questions(&parsed.questions) {
-                let _ = event_tx.send(CodexEvent::Status {
+                let _ = event_tx.send(ProviderEvent::Status {
                     text: "Codex requested interactive user input that Atlas2 cannot render as Telegram buttons."
                         .into(),
                 });
@@ -1127,8 +1016,8 @@ async fn handle_server_request(
                     request_id: request_id.clone(),
                 },
             );
-            let _ = event_tx.send(CodexEvent::UserInputRequested {
-                request: CodexPendingUserInput {
+            let _ = event_tx.send(ProviderEvent::UserInputRequested {
+                request: ProviderUserInputRequest {
                     request_id: user_input_id,
                     questions: parsed.questions,
                 },
@@ -1156,13 +1045,13 @@ async fn map_notification(
     params: &Value,
     command_outputs: &Arc<Mutex<HashMap<String, String>>>,
     text_outputs: &Arc<Mutex<HashMap<String, String>>>,
-) -> Option<CodexEvent> {
+) -> Option<ProviderEvent> {
     match method {
-        "thread/started" => Some(CodexEvent::ThreadStarted {
+        "thread/started" => Some(ProviderEvent::ThreadStarted {
             thread_id: extract_thread_id(params)?,
             resume_cursor_json: build_resume_cursor_json(params),
         }),
-        "turn/started" => Some(CodexEvent::Status {
+        "turn/started" => Some(ProviderEvent::Status {
             text: "Codex turn started".into(),
         }),
         "turn/completed" => {
@@ -1179,7 +1068,7 @@ async fn map_notification(
                     .and_then(Value::as_str)
                     .unwrap_or("Codex turn interrupted")
                     .to_string();
-                Some(CodexEvent::TurnInterrupted { message })
+                Some(ProviderEvent::TurnInterrupted { message })
             } else if status == "failed" {
                 let message = params
                     .get("turn")
@@ -1188,12 +1077,12 @@ async fn map_notification(
                     .and_then(Value::as_str)
                     .unwrap_or("Codex turn failed")
                     .to_string();
-                Some(CodexEvent::TurnFailed { message })
+                Some(ProviderEvent::TurnFailed { message })
             } else {
-                Some(CodexEvent::TurnCompleted)
+                Some(ProviderEvent::TurnCompleted)
             }
         }
-        "error" => Some(CodexEvent::TurnFailed {
+        "error" => Some(ProviderEvent::TurnFailed {
             message: params
                 .get("error")
                 .and_then(|error| error.get("message"))
@@ -1223,21 +1112,21 @@ async fn map_notification(
     }
 }
 
-fn map_task_complete_notification(params: &Value) -> Option<CodexEvent> {
+fn map_task_complete_notification(params: &Value) -> Option<ProviderEvent> {
     let message = params
         .get("msg")
         .and_then(|msg| msg.get("last_agent_message"))
         .and_then(Value::as_str)?;
-    extract_proposed_plan_markdown(message).map(|markdown| CodexEvent::PlanCompleted { markdown })
+    extract_proposed_plan_markdown(message).map(|markdown| ProviderEvent::PlanCompleted { markdown })
 }
 
-fn map_item_started(params: &Value) -> Option<CodexEvent> {
+fn map_item_started(params: &Value) -> Option<ProviderEvent> {
     let item = params.get("item")?;
     let item_type = item.get("type")?.as_str()?;
     if item_type != "commandExecution" {
         return None;
     }
-    Some(CodexEvent::CommandStarted {
+    Some(ProviderEvent::CommandStarted {
         command: item
             .get("command")
             .and_then(Value::as_str)
@@ -1250,7 +1139,7 @@ async fn map_item_completed(
     params: &Value,
     command_outputs: &Arc<Mutex<HashMap<String, String>>>,
     text_outputs: &Arc<Mutex<HashMap<String, String>>>,
-) -> Option<CodexEvent> {
+) -> Option<ProviderEvent> {
     let item = params.get("item")?;
     let item_type = item.get("type")?.as_str()?;
     match item_type {
@@ -1272,9 +1161,9 @@ async fn map_item_completed(
             if text.is_empty() {
                 None
             } else if let Some(markdown) = extract_proposed_plan_markdown(&text) {
-                Some(CodexEvent::PlanCompleted { markdown })
+                Some(ProviderEvent::PlanCompleted { markdown })
             } else {
-                Some(CodexEvent::Output { text })
+                Some(ProviderEvent::Output { text })
             }
         }
         "plan" | "Plan" => {
@@ -1288,7 +1177,7 @@ async fn map_item_completed(
             if markdown.is_empty() {
                 None
             } else {
-                Some(CodexEvent::PlanCompleted { markdown })
+                Some(ProviderEvent::PlanCompleted { markdown })
             }
         }
         "commandExecution" => {
@@ -1313,7 +1202,7 @@ async fn map_item_completed(
                     Some("failed") | Some("declined") => 1,
                     _ => -1,
                 });
-            Some(CodexEvent::CommandFinished {
+            Some(ProviderEvent::CommandFinished {
                 command: item
                     .get("command")
                     .and_then(Value::as_str)
@@ -1377,7 +1266,7 @@ fn supports_telegram_user_input_questions(questions: &[UserInputQuestion]) -> bo
         })
 }
 
-fn extract_thread_id(value: &Value) -> Option<CodexThreadId> {
+fn extract_thread_id(value: &Value) -> Option<ThreadId> {
     value
         .get("threadId")
         .and_then(Value::as_str)
@@ -1387,7 +1276,7 @@ fn extract_thread_id(value: &Value) -> Option<CodexThreadId> {
                 .and_then(|thread| thread.get("id"))
                 .and_then(Value::as_str)
         })
-        .map(|id| CodexThreadId(id.to_string()))
+        .map(|id| ThreadId(id.to_string()))
 }
 
 fn build_resume_cursor_json(value: &Value) -> Option<String> {
@@ -1426,14 +1315,14 @@ fn is_stale_thread_error_message(message: &str) -> bool {
 }
 
 fn should_restart_thread_from_resume_error(error: &AppError) -> bool {
-    let AppError::Codex(message) = error else {
+    let AppError::Provider(message) = error else {
         return false;
     };
     is_stale_thread_error_message(message)
 }
 
 fn should_retry_with_fresh_thread_after_error(
-    provider_thread_id: Option<&CodexThreadId>,
+    provider_thread_id: Option<&ThreadId>,
     retry_with_fresh_thread_available: bool,
     error: &AppError,
 ) -> bool {
@@ -1443,7 +1332,7 @@ fn should_retry_with_fresh_thread_after_error(
 }
 
 fn should_retry_with_fresh_thread_after_failure(
-    provider_thread_id: Option<&CodexThreadId>,
+    provider_thread_id: Option<&ThreadId>,
     retry_with_fresh_thread_available: bool,
     failure_message: &str,
     saw_material_turn_activity: bool,
@@ -1532,7 +1421,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use super::{
-        CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS, CodexEvent, ToolRequestUserInputParams,
+        CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS, ProviderEvent, ToolRequestUserInputParams,
         build_collaboration_mode, build_resume_cursor_json, extract_proposed_plan_markdown,
         extract_thread_id, extract_turn_id, is_stale_thread_error_message, map_item_completed,
         map_notification, map_task_complete_notification, should_restart_thread_from_resume_error,
@@ -1562,7 +1451,7 @@ mod tests {
 
     #[test]
     fn retries_with_fresh_thread_after_invalid_encrypted_content_resume_error() {
-        let error = AppError::Codex(
+        let error = AppError::Provider(
             "The encrypted content gAAA... could not be verified. Reason: Encrypted content could not be decrypted or parsed. code=invalid_encrypted_content"
                 .into(),
         );
@@ -1572,7 +1461,7 @@ mod tests {
 
     #[test]
     fn does_not_restart_thread_for_unrelated_resume_errors() {
-        let error = AppError::Codex("thread/resume failed with rate limit".into());
+        let error = AppError::Provider("thread/resume failed with rate limit".into());
 
         assert!(!should_restart_thread_from_resume_error(&error));
     }
@@ -1588,7 +1477,7 @@ mod tests {
     fn restarts_thread_when_rollout_is_missing() {
         // A thread id was persisted but its rollout never was (e.g. the first
         // turn failed before completing); resuming it must start fresh.
-        let error = AppError::Codex(
+        let error = AppError::Provider(
             "no rollout found for thread id 019ed606-6a50-7f41-974d-54a98d9580aa".into(),
         );
         assert!(should_restart_thread_from_resume_error(&error));
@@ -1597,7 +1486,7 @@ mod tests {
     #[test]
     fn retries_with_fresh_thread_after_early_stale_thread_failure() {
         assert!(should_retry_with_fresh_thread_after_failure(
-            Some(&crate::domain::CodexThreadId("thread_123".into())),
+            Some(&crate::domain::ThreadId("thread_123".into())),
             true,
             "invalid_encrypted_content",
             false,
@@ -1607,7 +1496,7 @@ mod tests {
     #[test]
     fn does_not_retry_with_fresh_thread_after_material_turn_activity() {
         assert!(!should_retry_with_fresh_thread_after_failure(
-            Some(&crate::domain::CodexThreadId("thread_123".into())),
+            Some(&crate::domain::ThreadId("thread_123".into())),
             true,
             "invalid_encrypted_content",
             true,
@@ -1675,7 +1564,7 @@ mod tests {
         .expect("agent message output event");
 
         match event {
-            CodexEvent::Output { text } => assert_eq!(text, "hello from codex"),
+            ProviderEvent::Output { text } => assert_eq!(text, "hello from codex"),
             other => panic!("unexpected event: {other:?}"),
         }
     }
@@ -1709,7 +1598,7 @@ mod tests {
         .expect("plan completion event");
 
         match event {
-            CodexEvent::PlanCompleted { markdown } => {
+            ProviderEvent::PlanCompleted { markdown } => {
                 assert_eq!(markdown, "## Final plan\n\n- one\n- two");
             }
             other => panic!("unexpected event: {other:?}"),
@@ -1729,7 +1618,7 @@ mod tests {
         .expect("plan completion event");
 
         match event {
-            CodexEvent::PlanCompleted { markdown } => {
+            ProviderEvent::PlanCompleted { markdown } => {
                 assert_eq!(markdown, "# Ship it\n\n- one");
             }
             other => panic!("unexpected event: {other:?}"),
@@ -1828,7 +1717,7 @@ mod tests {
         .expect("command completion event");
 
         match event {
-            CodexEvent::CommandFinished {
+            ProviderEvent::CommandFinished {
                 command,
                 exit_code,
                 output,
@@ -1862,7 +1751,7 @@ mod tests {
         .expect("interrupted turn event");
 
         match event {
-            CodexEvent::TurnInterrupted { message } => {
+            ProviderEvent::TurnInterrupted { message } => {
                 assert_eq!(message, "Stopped by user");
             }
             other => panic!("unexpected event: {other:?}"),

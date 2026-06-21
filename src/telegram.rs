@@ -63,6 +63,11 @@ impl TelegramClient {
         self.call("getUpdates", &payload).await
     }
 
+    pub async fn set_my_commands(&self, commands: &[BotCommand]) -> AppResult<bool> {
+        self.call("setMyCommands", &json!({ "commands": commands }))
+            .await
+    }
+
     pub async fn send_message(
         &self,
         chat_id: TelegramChatId,
@@ -512,13 +517,28 @@ pub fn button(text: impl Into<String>, callback_data: impl Into<String>) -> Inli
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BotCommand {
+    pub command: String,
+    pub description: String,
+}
+
+impl BotCommand {
+    pub fn new(command: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            description: description.into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::Value;
 
     use super::{
-        ParseMode, TELEGRAM_TEXT_LIMIT, TelegramEnvelope, TelegramFile, Update, split_message_text,
-        telegram_retry_after_seconds, trim_message_text,
+        BotCommand, ParseMode, TELEGRAM_TEXT_LIMIT, TelegramEnvelope, TelegramFile, Update,
+        split_message_text, telegram_retry_after_seconds, trim_message_text,
     };
 
     #[test]
@@ -595,5 +615,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(telegram_retry_after_seconds(&envelope), Some(12));
+    }
+
+    #[test]
+    fn serializes_bot_command_for_set_my_commands() {
+        let command = BotCommand::new("resume", "Resume an existing thread");
+
+        let value = serde_json::to_value(command).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "command": "resume",
+                "description": "Resume an existing thread"
+            })
+        );
     }
 }

@@ -1,9 +1,9 @@
-//! Resolution of Codex approval requests (approve / reject) raised during a turn.
+//! Resolution of provider approval requests (approve / reject) raised during a turn.
 
 use crate::{
-    codex::CodexApi,
     domain::{ApprovalId, ApprovalStatus, SessionStatus, TelegramChatId, TelegramUserId},
     error::{AppError, AppResult},
+    provider::ProviderRegistry,
     storage::Storage,
     telegram::TelegramApi,
 };
@@ -11,18 +11,18 @@ use crate::{
 use super::require_group_admin;
 
 #[derive(Clone)]
-pub struct ApprovalService<Cx: CodexApi, Tg: TelegramApi> {
+pub struct ApprovalService<Tg: TelegramApi> {
     storage: Storage,
     telegram: Tg,
-    codex: Cx,
+    providers: ProviderRegistry,
 }
 
-impl<Cx: CodexApi, Tg: TelegramApi> ApprovalService<Cx, Tg> {
-    pub fn new(storage: Storage, telegram: Tg, codex: Cx) -> Self {
+impl<Tg: TelegramApi> ApprovalService<Tg> {
+    pub fn new(storage: Storage, telegram: Tg, providers: ProviderRegistry) -> Self {
         Self {
             storage,
             telegram,
-            codex,
+            providers,
         }
     }
 
@@ -55,12 +55,19 @@ impl<Cx: CodexApi, Tg: TelegramApi> ApprovalService<Cx, Tg> {
             return Err(AppError::Validation(message.into()));
         }
 
+        let session = self
+            .storage
+            .get_session(&approval.session_id)
+            .await?
+            .ok_or_else(|| AppError::Validation("session no longer exists".into()))?;
+
         let new_status = if approved {
             ApprovalStatus::Approved
         } else {
             ApprovalStatus::Rejected
         };
-        self.codex
+        self.providers
+            .get(session.provider)?
             .resolve_approval(&approval.session_id, &approval_id, approved)
             .await?;
         self.storage
@@ -70,9 +77,10 @@ impl<Cx: CodexApi, Tg: TelegramApi> ApprovalService<Cx, Tg> {
             .update_session_status(&approval.session_id, SessionStatus::Running, None)
             .await?;
 
+        let provider_name = session.provider.display_name();
         Ok(match new_status {
-            ApprovalStatus::Approved => "Approval sent to Codex.".into(),
-            ApprovalStatus::Rejected => "Rejection sent to Codex.".into(),
+            ApprovalStatus::Approved => format!("Approval sent to {provider_name}."),
+            ApprovalStatus::Rejected => format!("Rejection sent to {provider_name}."),
             ApprovalStatus::Pending => unreachable!(),
             ApprovalStatus::Expired => unreachable!(),
         })

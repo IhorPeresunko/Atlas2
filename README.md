@@ -1,8 +1,8 @@
 # Atlas2
 
-Atlas2 connects Telegram groups to local Codex CLI sessions.
+Atlas2 connects Telegram groups to a local coding agent — Codex or Claude.
 
-Each Telegram group has one active Codex session at a time. A group admin runs `/new`, selects a historic project or taps `Add new project` to browse for a working directory, and then sends prompts in the group. Atlas2 uses `codex app-server`, streams Codex output back into Telegram as separate progress messages, and stores session state in SQLite.
+Each Telegram group has one active agent session at a time. A group admin runs `/new`, selects a historic project or taps `Add new project` to browse for a working directory, then picks which agent (Codex or Claude) should run the session, and sends prompts in the group. Atlas2 drives the chosen provider (Codex via `codex app-server`, Claude via the `claude` CLI in streaming mode), streams its output back into Telegram as separate progress messages, and stores session state in SQLite. Both providers are available from a single `atlas2 start`; the choice is made per session in `/new`.
 
 ## Current Features
 
@@ -26,7 +26,7 @@ Each Telegram group has one active Codex session at a time. A group admin runs `
 Requirements:
 
 - Linux x86_64
-- a local `codex` binary installed and logged in
+- a local agent binary installed and logged in for each provider you want to use: `codex` and/or `claude` (a session can only use a provider whose binary is present)
 
 ### Install
 
@@ -89,7 +89,7 @@ atlas2 run --stt-provider 11labs --stt-api-key sk_...
 1. Add the bot to a Telegram group.
 2. Make the bot an admin.
 3. Send `/new`.
-4. Reuse a historic project or tap `Add new project` and select a folder.
+4. Reuse a historic project or tap `Add new project` and select a folder, then pick the agent (Codex or Claude) for the session.
 5. Send prompts in the group.
 6. Send a Telegram voice message to have Atlas2 transcribe it and forward the transcript to Codex.
 7. Use `/plan <prompt>` when you want a plan-only turn without file changes.

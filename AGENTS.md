@@ -2,14 +2,14 @@
 
 ## Purpose
 
-Atlas2 is a Rust service that connects Telegram groups to Codex sessions running remotely.
+Atlas2 is a Rust service that connects Telegram groups to a local coding-agent provider (Codex or Claude) running on the same host.
 
 Core product behavior:
-- Each Codex session is represented by a separate Telegram group.
+- Each agent session is represented by a separate Telegram group.
 - A session must run from a selected project folder on the VPS.
-- Users send messages in Telegram and receive Codex output back in Telegram.
-- When Codex requires approval or action, Atlas2 must present that as Telegram buttons.
-- Atlas2 is a proxy/orchestrator, not a replacement for Codex itself.
+- Users send messages in Telegram and receive agent output back in Telegram.
+- When the agent requires approval or action, Atlas2 must present that as Telegram buttons.
+- Atlas2 is a proxy/orchestrator, not a replacement for the agent itself.
 
 ---
 
@@ -28,12 +28,12 @@ Core product behavior:
 ## Product Rules
 
 - The primary UX is Telegram groups.
-- One Telegram group maps to one Codex session.
-- One Codex session must have one explicit working directory.
+- One Telegram group maps to one agent session.
+- One agent session must have one explicit working directory.
 - Never run a session without a known, validated entry-point folder.
 - Folder selection is a first-class requirement, not an optional enhancement.
-- Approval requests from Codex must be surfaced as Telegram buttons whenever possible.
-- Telegram should receive Codex output as streamed progress updates, not only final results.
+- Approval requests from the agent must be surfaced as Telegram buttons whenever possible.
+- Telegram should receive agent output as streamed progress updates, not only final results.
 - Preserve session isolation. Messages, state, approvals, and working directory must not leak across groups.
 
 ---
@@ -41,12 +41,12 @@ Core product behavior:
 ## Architecture Rules
 
 - Apply strict separation of concerns.
-- Keep Telegram transport concerns separate from Codex process management.
+- Keep Telegram transport concerns separate from provider process management.
 - Keep session state management separate from Telegram handlers.
 - Keep filesystem/project-folder validation separate from business orchestration.
 - Keep infrastructure adapters focused on external systems only:
   - Telegram Bot API
-  - Codex CLI process execution
+  - coding-agent CLI process execution (Codex, Claude, ...) behind the `Provider` trait
   - database/storage
   - filesystem access
 - Keep business logic in services, not in Telegram handlers or process wrappers.
@@ -100,7 +100,7 @@ Core product behavior:
 - Prefer focused tests over broad, fragile end-to-end tests.
 - Test at the layer where the rule lives:
   - service tests for business rules and state transitions
-  - adapter tests for Codex/Telegram integration behavior
+  - adapter tests for provider/Telegram integration behavior
   - path validation tests for project folder safety
   - handler tests for callback routing and request parsing
 - Cover failure paths, not only happy paths.

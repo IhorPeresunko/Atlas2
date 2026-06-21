@@ -3,15 +3,17 @@
 use chrono::Utc;
 
 use crate::{
-    codex::CodexApi,
     config::Config,
     domain::{
-        FolderBrowseState, HistoricProject, SessionBackend, SessionId, SessionRecord,
-        SessionStatus, TelegramChatId, TelegramUserId, WorkspacePath,
+        FolderBrowseState, HistoricProject, ProviderKind, SessionId, SessionRecord, SessionStatus,
+        TelegramChatId, TelegramUserId, WorkspacePath,
     },
     error::{AppError, AppResult},
     filesystem::FilesystemService,
-    presentation::{historic_projects_markup, render_historic_projects_prompt},
+    presentation::{
+        historic_projects_markup, provider_picker_markup, render_historic_projects_prompt,
+        render_provider_picker_prompt,
+    },
     storage::Storage,
     telegram::{InlineKeyboardMarkup, TelegramApi, button},
 };
@@ -26,21 +28,25 @@ pub enum FolderCallbackResult {
 }
 
 #[derive(Clone)]
-pub struct FolderService<Cx: CodexApi, Tg: TelegramApi> {
+pub struct FolderService<Tg: TelegramApi> {
     storage: Storage,
     telegram: Tg,
     filesystem: FilesystemService,
     config: Config,
-    model: ModelService<Cx>,
+    model: ModelService,
+    /// Providers Atlas2 was built with, offered in the `/new` picker. When only
+    /// one is available the session is created with it directly.
+    available_providers: Vec<ProviderKind>,
 }
 
-impl<Cx: CodexApi, Tg: TelegramApi> FolderService<Cx, Tg> {
+impl<Tg: TelegramApi> FolderService<Tg> {
     pub fn new(
         storage: Storage,
         telegram: Tg,
         filesystem: FilesystemService,
         config: Config,
-        model: ModelService<Cx>,
+        model: ModelService,
+        available_providers: Vec<ProviderKind>,
     ) -> Self {
         Self {
             storage,
@@ -48,6 +54,7 @@ impl<Cx: CodexApi, Tg: TelegramApi> FolderService<Cx, Tg> {
             filesystem,
             config,
             model,
+            available_providers,
         }
     }
 
@@ -122,8 +129,7 @@ impl<Cx: CodexApi, Tg: TelegramApi> FolderService<Cx, Tg> {
                     .filesystem
                     .normalize_directory(&source_workspace.0)
                     .await?;
-                let text = self.start_new_session(chat_id, workspace).await?;
-                Ok(FolderCallbackResult::Replace(text))
+                self.start_new_session(chat_id, workspace).await
             }
             "project-add-new" => {
                 let text = self.begin_folder_selection(chat_id).await?;
@@ -192,8 +198,13 @@ impl<Cx: CodexApi, Tg: TelegramApi> FolderService<Cx, Tg> {
                     .normalize_directory(&state.current_path.0)
                     .await?;
                 self.storage.clear_folder_browse_state(chat_id).await?;
-                let text = self.start_new_session(chat_id, workspace).await?;
-                Ok(FolderCallbackResult::Replace(text))
+                self.start_new_session(chat_id, workspace).await
+            }
+            "newprovider-select" => {
+                let kind = ProviderKind::parse(raw_value).ok_or_else(|| {
+                    AppError::Validation("unknown provider in callback".into())
+                })?;
+                self.select_new_session_provider(chat_id, kind).await
             }
             "folder-cancel" => {
                 self.storage.clear_folder_browse_state(chat_id).await?;
@@ -223,17 +234,63 @@ impl<Cx: CodexApi, Tg: TelegramApi> FolderService<Cx, Tg> {
         existing
     }
 
+    /// A workspace has been chosen for a new session. With a single available
+    /// provider, create the session immediately; otherwise record the pending
+    /// workspace and ask the user which provider to use.
     async fn start_new_session(
         &self,
         chat_id: TelegramChatId,
         workspace: WorkspacePath,
+    ) -> AppResult<FolderCallbackResult> {
+        match self.available_providers.as_slice() {
+            [] => Err(AppError::Validation(
+                "no coding-agent provider is available".into(),
+            )),
+            [only] => {
+                let text = self.create_session(chat_id, workspace, *only).await?;
+                Ok(FolderCallbackResult::Replace(text))
+            }
+            kinds => {
+                self.storage
+                    .set_pending_new_session(chat_id, &workspace)
+                    .await?;
+                Ok(FolderCallbackResult::Render(
+                    render_provider_picker_prompt(&workspace.0),
+                    provider_picker_markup(kinds),
+                ))
+            }
+        }
+    }
+
+    /// The user picked a provider for the pending new session; create it.
+    async fn select_new_session_provider(
+        &self,
+        chat_id: TelegramChatId,
+        kind: ProviderKind,
+    ) -> AppResult<FolderCallbackResult> {
+        let workspace = self
+            .storage
+            .take_pending_new_session(chat_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::Validation("no pending new session; run /new again".into())
+            })?;
+        let text = self.create_session(chat_id, workspace, kind).await?;
+        Ok(FolderCallbackResult::Replace(text))
+    }
+
+    async fn create_session(
+        &self,
+        chat_id: TelegramChatId,
+        workspace: WorkspacePath,
+        provider: ProviderKind,
     ) -> AppResult<String> {
         let now = Utc::now();
         let session = SessionRecord {
             session_id: SessionId::new(),
             chat_id,
             workspace_path: workspace.clone(),
-            backend: SessionBackend::AppServer,
+            provider,
             provider_thread_id: None,
             resume_cursor_json: None,
             status: SessionStatus::Ready,
@@ -245,7 +302,11 @@ impl<Cx: CodexApi, Tg: TelegramApi> FolderService<Cx, Tg> {
         self.storage
             .set_active_session(chat_id, Some(&session.session_id))
             .await?;
-        let model_note = match self.model.ensure_chat_model(chat_id, &workspace.0).await {
+        let model_note = match self
+            .model
+            .reconcile_model_for_provider(chat_id, provider, &workspace.0)
+            .await
+        {
             Ok(Some(model)) => format!("\nModel: {model}."),
             Ok(None) => String::new(),
             Err(error) => {
@@ -254,7 +315,8 @@ impl<Cx: CodexApi, Tg: TelegramApi> FolderService<Cx, Tg> {
             }
         };
         Ok(format!(
-            "Started new session in `{}`.{model_note}\nSend a prompt to start working.",
+            "Started new {} session in `{}`.{model_note}\nSend a prompt to start working.",
+            provider.display_name(),
             workspace.0
         ))
     }

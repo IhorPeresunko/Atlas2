@@ -8,9 +8,9 @@ use sqlx::{
 
 use crate::{
     domain::{
-        ApprovalId, ApprovalStatus, ChatBinding, CodexThreadId, FolderBrowseState, HistoricProject,
+        ApprovalId, ApprovalStatus, ChatBinding, ThreadId, FolderBrowseState, HistoricProject,
         PendingApproval, PendingPlanFollowUp, PendingUserInput, PlanFollowUpId, PlanFollowUpStatus,
-        SessionBackend, SessionId, SessionRecord, SessionStatus, SessionSummary, TelegramChatId,
+        ProviderKind, SessionId, SessionRecord, SessionStatus, SessionSummary, TelegramChatId,
         TelegramUserId, UserInputRequestId, UserInputStatus, WorkspacePath,
     },
     error::{AppError, AppResult},
@@ -55,8 +55,7 @@ impl Storage {
                 session_id TEXT PRIMARY KEY,
                 chat_id INTEGER NOT NULL,
                 workspace_path TEXT NOT NULL,
-                codex_thread_id TEXT,
-                backend TEXT NOT NULL DEFAULT 'exec_legacy',
+                provider TEXT NOT NULL DEFAULT 'codex',
                 provider_thread_id TEXT,
                 resume_cursor_json TEXT,
                 status TEXT NOT NULL,
@@ -68,6 +67,11 @@ impl Storage {
             CREATE TABLE IF NOT EXISTS folder_browse_state (
                 chat_id INTEGER PRIMARY KEY,
                 current_path TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS pending_new_session (
+                chat_id INTEGER PRIMARY KEY,
+                workspace_path TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS pending_approvals (
@@ -106,7 +110,7 @@ impl Storage {
         .execute(&self.pool)
         .await?;
 
-        self.ensure_session_column("backend", "TEXT NOT NULL DEFAULT 'exec_legacy'")
+        self.ensure_session_column("provider", "TEXT NOT NULL DEFAULT 'codex'")
             .await?;
         self.ensure_session_column("provider_thread_id", "TEXT")
             .await?;
@@ -115,16 +119,6 @@ impl Storage {
         self.ensure_session_column("last_error", "TEXT").await?;
         self.ensure_chat_column("model", "TEXT").await?;
         self.ensure_chat_column("reasoning_effort", "TEXT").await?;
-        sqlx::query(
-            r#"
-            UPDATE sessions
-            SET provider_thread_id = COALESCE(provider_thread_id, codex_thread_id)
-            WHERE provider_thread_id IS NULL AND codex_thread_id IS NOT NULL
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
         Ok(())
     }
 
@@ -275,15 +269,15 @@ impl Storage {
         sqlx::query(
             r#"
             INSERT INTO sessions (
-                session_id, chat_id, workspace_path, codex_thread_id, backend,
+                session_id, chat_id, workspace_path, provider,
                 provider_thread_id, resume_cursor_json, status, last_error, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
         )
         .bind(session.session_id.0.to_string())
         .bind(session.chat_id.0)
         .bind(&session.workspace_path.0)
-        .bind(session.backend.as_str())
+        .bind(session.provider.as_str())
         .bind(session.provider_thread_id.as_ref().map(|id| id.0.as_str()))
         .bind(session.resume_cursor_json.as_deref())
         .bind(session.status.as_str())
@@ -296,13 +290,32 @@ impl Storage {
         Ok(())
     }
 
+    /// Loads a session by id regardless of whether it is the chat's active one.
+    /// Used to route live-turn actions (approvals, stop) to the provider that
+    /// owns the session.
+    pub async fn get_session(&self, session_id: &SessionId) -> AppResult<Option<SessionRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT s.session_id, s.chat_id, s.workspace_path, s.provider, s.provider_thread_id,
+                   s.resume_cursor_json, s.status, s.last_error, s.created_at, s.updated_at
+            FROM sessions s
+            WHERE s.session_id = ?1
+            "#,
+        )
+        .bind(session_id.0.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(map_session).transpose()
+    }
+
     pub async fn get_active_session_for_chat(
         &self,
         chat_id: TelegramChatId,
     ) -> AppResult<Option<SessionRecord>> {
         let row = sqlx::query(
             r#"
-            SELECT s.session_id, s.chat_id, s.workspace_path, s.backend, s.provider_thread_id,
+            SELECT s.session_id, s.chat_id, s.workspace_path, s.provider, s.provider_thread_id,
                    s.resume_cursor_json, s.status, s.last_error, s.created_at, s.updated_at
             FROM chats c
             JOIN sessions s ON s.session_id = c.active_session_id
@@ -344,7 +357,7 @@ impl Storage {
     pub async fn update_session_provider_state(
         &self,
         session_id: &SessionId,
-        provider_thread_id: Option<&CodexThreadId>,
+        provider_thread_id: Option<&ThreadId>,
         resume_cursor_json: Option<&str>,
     ) -> AppResult<()> {
         sqlx::query(
@@ -366,15 +379,14 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn mark_interrupted_app_server_sessions_failed(&self) -> AppResult<()> {
+    pub async fn mark_interrupted_sessions_failed(&self) -> AppResult<()> {
         sqlx::query(
             r#"
             UPDATE sessions
             SET status = 'failed',
-                last_error = 'Atlas2 restarted while the app-server runtime was active. Send a new prompt to resume from the last saved thread.',
+                last_error = 'Atlas2 restarted while a turn was active. Send a new prompt to resume from the last saved thread.',
                 updated_at = ?1
-            WHERE backend = 'app_server'
-              AND status IN ('running', 'waiting_for_approval', 'waiting_for_input')
+            WHERE status IN ('running', 'waiting_for_approval', 'waiting_for_input')
             "#,
         )
         .bind(Utc::now().to_rfc3339())
@@ -386,7 +398,7 @@ impl Storage {
     pub async fn list_sessions(&self) -> AppResult<Vec<SessionSummary>> {
         let rows = sqlx::query(
             r#"
-            SELECT s.session_id, s.chat_id, c.title, s.workspace_path, s.backend, s.status,
+            SELECT s.session_id, s.chat_id, c.title, s.workspace_path, s.provider, s.status,
                    s.provider_thread_id, s.last_error, s.created_at
             FROM sessions s
             LEFT JOIN chats c ON c.chat_id = s.chat_id
@@ -501,6 +513,43 @@ impl Storage {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Records the workspace chosen for a not-yet-created session while the user
+    /// picks a provider in the `/new` flow.
+    pub async fn set_pending_new_session(
+        &self,
+        chat_id: TelegramChatId,
+        workspace: &WorkspacePath,
+    ) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO pending_new_session (chat_id, workspace_path)
+            VALUES (?1, ?2)
+            ON CONFLICT(chat_id) DO UPDATE SET workspace_path = excluded.workspace_path
+            "#,
+        )
+        .bind(chat_id.0)
+        .bind(&workspace.0)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Reads and clears the pending new-session workspace for a chat.
+    pub async fn take_pending_new_session(
+        &self,
+        chat_id: TelegramChatId,
+    ) -> AppResult<Option<WorkspacePath>> {
+        let row = sqlx::query("SELECT workspace_path FROM pending_new_session WHERE chat_id = ?1")
+            .bind(chat_id.0)
+            .fetch_optional(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM pending_new_session WHERE chat_id = ?1")
+            .bind(chat_id.0)
+            .execute(&self.pool)
+            .await?;
+        Ok(row.map(|row| WorkspacePath(row.get::<String, _>("workspace_path"))))
     }
 
     pub async fn insert_pending_approval(&self, approval: &PendingApproval) -> AppResult<()> {
@@ -824,12 +873,12 @@ fn map_session(row: sqlx::sqlite::SqliteRow) -> AppResult<SessionRecord> {
         session_id: SessionId(parse_uuid(&row.get::<String, _>("session_id"))?),
         chat_id: TelegramChatId(row.get::<i64, _>("chat_id")),
         workspace_path: WorkspacePath(row.get::<String, _>("workspace_path")),
-        backend: SessionBackend::parse(&row.get::<String, _>("backend")).ok_or_else(|| {
-            AppError::Storage(sqlx::Error::Decode("invalid session backend".into()))
+        provider: ProviderKind::parse(&row.get::<String, _>("provider")).ok_or_else(|| {
+            AppError::Storage(sqlx::Error::Decode("invalid session provider".into()))
         })?,
         provider_thread_id: row
             .get::<Option<String>, _>("provider_thread_id")
-            .map(CodexThreadId),
+            .map(ThreadId),
         resume_cursor_json: row.get::<Option<String>, _>("resume_cursor_json"),
         status: SessionStatus::parse(&row.get::<String, _>("status")).ok_or_else(|| {
             AppError::Storage(sqlx::Error::Decode("invalid session status".into()))
@@ -846,15 +895,15 @@ fn map_session_summary(row: sqlx::sqlite::SqliteRow) -> AppResult<SessionSummary
         chat_id: TelegramChatId(row.get::<i64, _>("chat_id")),
         chat_title: row.get::<Option<String>, _>("title"),
         workspace_path: WorkspacePath(row.get::<String, _>("workspace_path")),
-        backend: SessionBackend::parse(&row.get::<String, _>("backend")).ok_or_else(|| {
-            AppError::Storage(sqlx::Error::Decode("invalid session backend".into()))
+        provider: ProviderKind::parse(&row.get::<String, _>("provider")).ok_or_else(|| {
+            AppError::Storage(sqlx::Error::Decode("invalid session provider".into()))
         })?,
         status: SessionStatus::parse(&row.get::<String, _>("status")).ok_or_else(|| {
             AppError::Storage(sqlx::Error::Decode("invalid session status".into()))
         })?,
         provider_thread_id: row
             .get::<Option<String>, _>("provider_thread_id")
-            .map(CodexThreadId),
+            .map(ThreadId),
         last_error: row.get::<Option<String>, _>("last_error"),
         created_at: parse_datetime(&row.get::<String, _>("created_at"))?,
     })
@@ -921,8 +970,8 @@ mod tests {
 
     use super::Storage;
     use crate::domain::{
-        ApprovalId, ApprovalStatus, ChatBinding, CodexThreadId, PendingApproval,
-        PendingPlanFollowUp, PendingUserInput, PlanFollowUpId, PlanFollowUpStatus, SessionBackend,
+        ApprovalId, ApprovalStatus, ChatBinding, ThreadId, PendingApproval,
+        PendingPlanFollowUp, PendingUserInput, PlanFollowUpId, PlanFollowUpStatus, ProviderKind,
         SessionId, SessionRecord, SessionStatus, TelegramChatId, UserInputAnswer, UserInputOption,
         UserInputQuestion, UserInputRequestId, UserInputStatus, WorkspacePath,
     };
@@ -940,7 +989,7 @@ mod tests {
             session_id: SessionId::new(),
             chat_id: TelegramChatId(10),
             workspace_path: WorkspacePath("/tmp/project".into()),
-            backend: SessionBackend::AppServer,
+            provider: ProviderKind::Codex,
             provider_thread_id: None,
             resume_cursor_json: None,
             status: SessionStatus::Ready,
@@ -973,18 +1022,18 @@ mod tests {
             })
         );
         assert_eq!(active.workspace_path.0, "/tmp/project");
-        assert_eq!(active.backend, SessionBackend::AppServer);
+        assert_eq!(active.provider, ProviderKind::Codex);
     }
 
     #[tokio::test]
-    async fn marks_interrupted_app_server_sessions_failed() {
+    async fn marks_interrupted_sessions_failed() {
         let storage = Storage::connect("sqlite::memory:").await.unwrap();
         let session = SessionRecord {
             session_id: SessionId::new(),
             chat_id: TelegramChatId(12),
             workspace_path: WorkspacePath("/tmp/project".into()),
-            backend: SessionBackend::AppServer,
-            provider_thread_id: Some(CodexThreadId("thread_123".into())),
+            provider: ProviderKind::Codex,
+            provider_thread_id: Some(ThreadId("thread_123".into())),
             resume_cursor_json: Some(r#"{"threadId":"thread_123"}"#.into()),
             status: SessionStatus::Running,
             last_error: None,
@@ -994,7 +1043,7 @@ mod tests {
         storage.insert_session(&session).await.unwrap();
 
         storage
-            .mark_interrupted_app_server_sessions_failed()
+            .mark_interrupted_sessions_failed()
             .await
             .unwrap();
 
@@ -1016,7 +1065,7 @@ mod tests {
             session_id: SessionId::new(),
             chat_id: TelegramChatId(14),
             workspace_path: WorkspacePath("/tmp/project".into()),
-            backend: SessionBackend::AppServer,
+            provider: ProviderKind::Codex,
             provider_thread_id: None,
             resume_cursor_json: None,
             status: SessionStatus::WaitingForApproval,
@@ -1058,7 +1107,7 @@ mod tests {
             session_id: SessionId::new(),
             chat_id: TelegramChatId(15),
             workspace_path: WorkspacePath("/tmp/project".into()),
-            backend: SessionBackend::AppServer,
+            provider: ProviderKind::Codex,
             provider_thread_id: None,
             resume_cursor_json: None,
             status: SessionStatus::WaitingForInput,
@@ -1141,7 +1190,7 @@ mod tests {
             session_id: SessionId::new(),
             chat_id: TelegramChatId(17),
             workspace_path: WorkspacePath("/tmp/project".into()),
-            backend: SessionBackend::AppServer,
+            provider: ProviderKind::Codex,
             provider_thread_id: None,
             resume_cursor_json: None,
             status: SessionStatus::WaitingForInput,
@@ -1188,7 +1237,7 @@ mod tests {
             session_id: SessionId::new(),
             chat_id: TelegramChatId(16),
             workspace_path: WorkspacePath("/tmp/project".into()),
-            backend: SessionBackend::AppServer,
+            provider: ProviderKind::Codex,
             provider_thread_id: None,
             resume_cursor_json: None,
             status: SessionStatus::Ready,
@@ -1259,7 +1308,7 @@ mod tests {
                 session_id: SessionId::new(),
                 chat_id,
                 workspace_path: workspace_a.clone(),
-                backend: SessionBackend::AppServer,
+                provider: ProviderKind::Codex,
                 provider_thread_id: None,
                 resume_cursor_json: None,
                 status: SessionStatus::Ready,
@@ -1274,7 +1323,7 @@ mod tests {
                 session_id: SessionId::new(),
                 chat_id,
                 workspace_path: workspace_b.clone(),
-                backend: SessionBackend::AppServer,
+                provider: ProviderKind::Codex,
                 provider_thread_id: None,
                 resume_cursor_json: None,
                 status: SessionStatus::Ready,
@@ -1289,7 +1338,7 @@ mod tests {
                 session_id: SessionId::new(),
                 chat_id,
                 workspace_path: workspace_a.clone(),
-                backend: SessionBackend::AppServer,
+                provider: ProviderKind::Codex,
                 provider_thread_id: None,
                 resume_cursor_json: None,
                 status: SessionStatus::Ready,
@@ -1304,7 +1353,7 @@ mod tests {
                 session_id: SessionId::new(),
                 chat_id: TelegramChatId(31),
                 workspace_path: WorkspacePath("/tmp/other-chat".into()),
-                backend: SessionBackend::AppServer,
+                provider: ProviderKind::Codex,
                 provider_thread_id: None,
                 resume_cursor_json: None,
                 status: SessionStatus::Ready,
@@ -1332,7 +1381,7 @@ mod tests {
             session_id: SessionId::new(),
             chat_id: TelegramChatId(40),
             workspace_path: WorkspacePath("/tmp/project".into()),
-            backend: SessionBackend::AppServer,
+            provider: ProviderKind::Codex,
             provider_thread_id: None,
             resume_cursor_json: None,
             status: SessionStatus::Ready,

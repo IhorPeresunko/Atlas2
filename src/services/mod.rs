@@ -1,10 +1,9 @@
 use crate::{
-    codex::{CodexApi, CodexClient},
-    codex_sessions::CodexSessionsReader,
     config::Config,
     domain::{TelegramChatId, TelegramUserId},
     error::{AppError, AppResult},
     filesystem::FilesystemService,
+    provider::{ProviderRegistry, ThreadReaderRegistry},
     storage::Storage,
     stt::SttClient,
     telegram::{TelegramApi, TelegramClient},
@@ -45,45 +44,45 @@ pub(crate) async fn require_group_admin<Tg: TelegramApi>(
 }
 
 #[derive(Clone)]
-pub struct AppServices<Cx: CodexApi = CodexClient, Tg: TelegramApi = TelegramClient> {
+pub struct AppServices<Tg: TelegramApi = TelegramClient> {
     pub config: Config,
     pub storage: Storage,
     pub telegram: Tg,
-    pub folder: FolderService<Cx, Tg>,
-    pub model: ModelService<Cx>,
-    pub approvals: ApprovalService<Cx, Tg>,
-    pub user_input: UserInputService<Cx, Tg>,
+    pub folder: FolderService<Tg>,
+    pub model: ModelService,
+    pub approvals: ApprovalService<Tg>,
+    pub user_input: UserInputService<Tg>,
     pub plans: PlanService<Tg>,
     pub resume: ResumeService<Tg>,
-    pub turns: TurnService<Cx, Tg>,
+    pub turns: TurnService<Tg>,
 }
 
-impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> AppServices<Cx, Tg> {
+impl<Tg: TelegramApi + 'static> AppServices<Tg> {
     pub fn new(
         config: Config,
         storage: Storage,
         telegram: Tg,
         filesystem: FilesystemService,
-        codex: Cx,
+        providers: ProviderRegistry,
+        readers: ThreadReaderRegistry,
         stt: SttClient,
     ) -> Self {
-        let model = ModelService::new(storage.clone(), codex.clone());
+        let model = ModelService::new(storage.clone(), providers.clone());
         let folder = FolderService::new(
             storage.clone(),
             telegram.clone(),
             filesystem.clone(),
             config.clone(),
             model.clone(),
+            providers.available_kinds(),
         );
-        let approvals = ApprovalService::new(storage.clone(), telegram.clone(), codex.clone());
-        let user_input = UserInputService::new(storage.clone(), telegram.clone(), codex.clone());
+        let approvals = ApprovalService::new(storage.clone(), telegram.clone(), providers.clone());
+        let user_input =
+            UserInputService::new(storage.clone(), telegram.clone(), providers.clone());
         let plans = PlanService::new(storage.clone(), telegram.clone());
-        let resume = ResumeService::new(
-            storage.clone(),
-            telegram.clone(),
-            CodexSessionsReader::new(config.codex_sessions_dir.clone()),
-        );
-        let turns = TurnService::new(storage.clone(), telegram.clone(), codex, stt, model.clone());
+        let resume = ResumeService::new(storage.clone(), telegram.clone(), readers);
+        let turns =
+            TurnService::new(storage.clone(), telegram.clone(), providers, stt, model.clone());
         Self {
             config,
             storage,
@@ -131,11 +130,11 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> AppServices<Cx, Tg> {
                 .map(|id| id.0)
                 .unwrap_or_else(|| "not started".into());
             lines.push(format!(
-                "- {} | chat={} | workspace={} | backend={} | status={} | thread={}",
+                "- {} | chat={} | workspace={} | provider={} | status={} | thread={}",
                 session.session_id.0,
                 title,
                 session.workspace_path.0,
-                session.backend.as_str(),
+                session.provider.as_str(),
                 session.status.as_str(),
                 thread
             ));
@@ -146,15 +145,15 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> AppServices<Cx, Tg> {
 
 #[cfg(test)]
 mod tests {
-    use crate::codex::CodexClient;
+    use crate::provider::CodexProvider;
     use crate::config::{Config, SttProvider};
     use crate::domain::{
         HistoricProject, PendingPlanFollowUp, PendingUserInput, PlanFollowUpId, PlanFollowUpStatus,
-        SessionBackend, SessionId, SessionRecord, SessionStatus, TelegramChatId, UserInputOption,
+        ProviderKind, SessionId, SessionRecord, SessionStatus, TelegramChatId, UserInputOption,
         UserInputQuestion, UserInputRequestId, UserInputStatus, WorkspacePath,
     };
     use crate::{
-        codex::build_codex_prompt,
+        provider::codex::build_codex_prompt,
         domain::PromptMode,
         presentation::{
             TELEGRAM_TEXT_LIMIT, TelegramTurnUpdate, TurnTerminalState, compact_text_for_telegram,
@@ -181,6 +180,8 @@ mod tests {
             database_url: "sqlite::memory:".into(),
             codex_bin: "codex".into(),
             codex_sessions_dir: std::path::PathBuf::from("/tmp/atlas2-test-sessions"),
+            claude_bin: "claude".into(),
+            claude_sessions_dir: std::path::PathBuf::from("/tmp/atlas2-test-claude-sessions"),
             poll_timeout_seconds: 30,
             max_directory_entries: 20,
             workspace_additional_writable_dirs: Vec::new(),
@@ -280,7 +281,7 @@ mod tests {
 
     #[test]
     fn stopped_turn_terminal_text_is_stable() {
-        let text = render_turn_terminal_text(TurnTerminalState::Stopped, None);
+        let text = render_turn_terminal_text("Codex", TurnTerminalState::Stopped, None);
 
         assert_eq!(text, "Codex turn stopped.");
     }
@@ -406,7 +407,7 @@ mod tests {
             resolved_by: None,
         };
 
-        let text = render_user_input_prompt(&request);
+        let text = render_user_input_prompt("Codex", &request);
         let markup = user_input_markup(&request).unwrap();
 
         assert!(text.contains("Codex needs your input (1/2)"));
@@ -485,7 +486,7 @@ mod tests {
                 session_id: SessionId::new(),
                 chat_id,
                 workspace_path: workspace.clone(),
-                backend: SessionBackend::AppServer,
+                provider: ProviderKind::Codex,
                 provider_thread_id: None,
                 resume_cursor_json: None,
                 status: SessionStatus::Ready,
@@ -496,12 +497,14 @@ mod tests {
             .await
             .unwrap();
 
+        let (providers, readers) = registries_for(CodexProvider::new("codex".into(), Vec::new()));
         let services = AppServices::new(
             test_config(),
             storage,
             TelegramClient::new("http://127.0.0.1:9", "token"),
             crate::filesystem::FilesystemService::default(),
-            CodexClient::new("codex".into(), Vec::new()),
+            providers,
+            readers,
             SttClient::Disabled,
         );
 
@@ -520,7 +523,22 @@ mod tests {
     }
 
     use super::UserInputCallbackResult;
-    use crate::codex::{CodexApi, CodexEvent, CodexTurnResult, ModelOption};
+    use crate::provider::{
+        ModelOption, Provider, ProviderEvent, ProviderRegistry, ThreadReaderRegistry, TurnResult,
+    };
+
+    /// Registers `provider` under the Codex kind (the kind test fixtures seed)
+    /// with an empty reader registry, so services can route to it.
+    fn registries_for<P: Provider + 'static>(
+        provider: P,
+    ) -> (ProviderRegistry, ThreadReaderRegistry) {
+        let mut providers: HashMap<crate::domain::ProviderKind, Arc<dyn Provider>> = HashMap::new();
+        providers.insert(crate::domain::ProviderKind::Codex, Arc::new(provider));
+        (
+            ProviderRegistry::new(providers),
+            ThreadReaderRegistry::new(HashMap::new()),
+        )
+    }
     use crate::domain::{
         ApprovalId, ApprovalStatus, PendingApproval, TelegramUserId, UserInputAnswer,
     };
@@ -538,7 +556,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl CodexApi for FakeCodex {
+    impl Provider for FakeCodex {
         async fn list_models(&self, _workspace_path: &str) -> AppResult<Vec<ModelOption>> {
             Ok(Vec::new())
         }
@@ -549,9 +567,9 @@ mod tests {
             _mode: PromptMode,
             _model: Option<&str>,
             _reasoning_effort: Option<&str>,
-            _on_event: Box<dyn FnMut(CodexEvent) -> AppResult<()> + Send>,
-        ) -> AppResult<CodexTurnResult> {
-            Ok(CodexTurnResult::default())
+            _on_event: Box<dyn FnMut(ProviderEvent) -> AppResult<()> + Send>,
+        ) -> AppResult<TurnResult> {
+            Ok(TurnResult::default())
         }
         async fn resolve_approval(
             &self,
@@ -659,15 +677,17 @@ mod tests {
         }
     }
 
-    async fn services_with_fakes(admin: bool) -> (AppServices<FakeCodex, FakeTelegram>, FakeCodex) {
+    async fn services_with_fakes(admin: bool) -> (AppServices<FakeTelegram>, FakeCodex) {
         let storage = Storage::connect("sqlite::memory:").await.unwrap();
         let codex = FakeCodex::default();
+        let (providers, readers) = registries_for(codex.clone());
         let services = AppServices::new(
             test_config(),
             storage,
             FakeTelegram { admin },
             FilesystemService::default(),
-            codex.clone(),
+            providers,
+            readers,
             SttClient::Disabled,
         );
         (services, codex)
@@ -678,7 +698,7 @@ mod tests {
             session_id: SessionId::new(),
             chat_id,
             workspace_path: WorkspacePath("/tmp".into()),
-            backend: SessionBackend::AppServer,
+            provider: ProviderKind::Codex,
             provider_thread_id: None,
             resume_cursor_json: None,
             status: SessionStatus::WaitingForApproval,

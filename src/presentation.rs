@@ -9,6 +9,7 @@ use regex::Regex;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
+    codex_sessions::{CodexConversationMessage, CodexMessageRole, CodexThreadSummary},
     domain::{
         HistoricProject, PendingPlanFollowUp, PendingUserInput, SessionId, TelegramChatId,
         UserInputOption,
@@ -73,6 +74,59 @@ pub(crate) fn historic_projects_markup(projects: &[HistoricProject]) -> InlineKe
     }
     buttons.push(button("Add new project", "project-add-new:current"));
     InlineKeyboardMarkup::single_column(buttons)
+}
+
+pub(crate) fn render_resume_prompt(workspace: &str) -> String {
+    format!("Pick a Codex thread to resume in `{workspace}`:")
+}
+
+pub(crate) fn resume_threads_markup(threads: &[CodexThreadSummary]) -> InlineKeyboardMarkup {
+    let buttons = threads
+        .iter()
+        .map(|thread| {
+            button(
+                resume_thread_label(thread),
+                format!("resume-select:{}", thread.thread_id.0),
+            )
+        })
+        .collect();
+    InlineKeyboardMarkup::single_column(buttons)
+}
+
+fn resume_thread_label(thread: &CodexThreadSummary) -> String {
+    let when = thread.started_at.format("%m-%d %H:%M");
+    let preview = if thread.preview.is_empty() {
+        "(no prompt)"
+    } else {
+        &thread.preview
+    };
+    truncate_chars(&format!("{when}  {preview}"), 60)
+}
+
+pub(crate) fn render_resume_transcript(messages: &[CodexConversationMessage]) -> String {
+    if messages.is_empty() {
+        return "(no messages found in this thread)".into();
+    }
+    messages
+        .iter()
+        .map(|message| {
+            let speaker = match message.role {
+                CodexMessageRole::User => "You",
+                CodexMessageRole::Assistant => "Codex",
+            };
+            format!("{speaker}:\n{}", message.text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
 }
 
 pub(crate) fn trim_for_telegram(text: &str) -> String {

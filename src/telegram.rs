@@ -259,6 +259,13 @@ pub(crate) trait TelegramApi: Clone + Send + Sync {
 
     async fn delete_message(&self, chat_id: TelegramChatId, message_id: i64) -> AppResult<bool>;
 
+    async fn answer_callback_query(
+        &self,
+        callback_query_id: &str,
+        text: &str,
+        show_alert: bool,
+    ) -> AppResult<bool>;
+
     async fn get_chat_member(
         &self,
         chat_id: TelegramChatId,
@@ -296,6 +303,15 @@ impl TelegramApi for TelegramClient {
 
     async fn delete_message(&self, chat_id: TelegramChatId, message_id: i64) -> AppResult<bool> {
         TelegramClient::delete_message(self, chat_id, message_id).await
+    }
+
+    async fn answer_callback_query(
+        &self,
+        callback_query_id: &str,
+        text: &str,
+        show_alert: bool,
+    ) -> AppResult<bool> {
+        TelegramClient::answer_callback_query(self, callback_query_id, text, show_alert).await
     }
 
     async fn get_chat_member(

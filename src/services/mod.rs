@@ -1,5 +1,6 @@
 use crate::{
     codex::{CodexApi, CodexClient},
+    codex_sessions::CodexSessionsReader,
     config::Config,
     domain::{TelegramChatId, TelegramUserId},
     error::{AppError, AppResult},
@@ -13,6 +14,7 @@ mod approval;
 mod folder;
 mod model;
 mod plan;
+mod resume;
 mod turn;
 mod user_input;
 
@@ -22,6 +24,7 @@ pub use model::{ModelCallbackResult, ModelService};
 #[cfg(test)]
 pub(crate) use plan::build_plan_implementation_prompt;
 pub use plan::{PlanFollowUpCallbackResult, PlanService};
+pub use resume::ResumeService;
 pub use turn::TurnService;
 pub use user_input::{UserInputCallbackResult, UserInputService, UserInputTextResult};
 
@@ -51,6 +54,7 @@ pub struct AppServices<Cx: CodexApi = CodexClient, Tg: TelegramApi = TelegramCli
     pub approvals: ApprovalService<Cx, Tg>,
     pub user_input: UserInputService<Cx, Tg>,
     pub plans: PlanService<Tg>,
+    pub resume: ResumeService<Tg>,
     pub turns: TurnService<Cx, Tg>,
 }
 
@@ -74,6 +78,11 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> AppServices<Cx, Tg> {
         let approvals = ApprovalService::new(storage.clone(), telegram.clone(), codex.clone());
         let user_input = UserInputService::new(storage.clone(), telegram.clone(), codex.clone());
         let plans = PlanService::new(storage.clone(), telegram.clone());
+        let resume = ResumeService::new(
+            storage.clone(),
+            telegram.clone(),
+            CodexSessionsReader::new(config.codex_sessions_dir.clone()),
+        );
         let turns = TurnService::new(storage.clone(), telegram.clone(), codex, stt, model.clone());
         Self {
             config,
@@ -84,6 +93,7 @@ impl<Cx: CodexApi + 'static, Tg: TelegramApi + 'static> AppServices<Cx, Tg> {
             approvals,
             user_input,
             plans,
+            resume,
             turns,
         }
     }
@@ -170,6 +180,7 @@ mod tests {
             telegram_api_base: "http://127.0.0.1:9".into(),
             database_url: "sqlite::memory:".into(),
             codex_bin: "codex".into(),
+            codex_sessions_dir: std::path::PathBuf::from("/tmp/atlas2-test-sessions"),
             poll_timeout_seconds: 30,
             max_directory_entries: 20,
             workspace_additional_writable_dirs: Vec::new(),
@@ -616,6 +627,14 @@ mod tests {
             &self,
             _chat_id: TelegramChatId,
             _message_id: i64,
+        ) -> AppResult<bool> {
+            Ok(true)
+        }
+        async fn answer_callback_query(
+            &self,
+            _callback_query_id: &str,
+            _text: &str,
+            _show_alert: bool,
         ) -> AppResult<bool> {
             Ok(true)
         }

@@ -7,6 +7,7 @@ Each Telegram group has one active Codex session at a time. A group admin runs `
 ## Current Features
 
 - `/new` historic project picker plus folder selection inside Telegram
+- `/resume` to attach the active session to an existing Codex thread in the same workspace (including threads started from the laptop Codex CLI), showing its last 10 messages
 - one active session per Telegram group
 - prompts sent from Telegram to Codex
 - Telegram `voice` messages transcribed through ElevenLabs STT when enabled

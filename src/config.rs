@@ -6,7 +6,7 @@ use std::{
 };
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 
 use crate::error::{AppError, AppResult};
 
@@ -80,6 +80,7 @@ pub struct Config {
     pub telegram_api_base: String,
     pub database_url: String,
     pub codex_bin: String,
+    pub codex_sessions_dir: PathBuf,
     pub poll_timeout_seconds: u64,
     pub max_directory_entries: usize,
     pub workspace_additional_writable_dirs: Vec<PathBuf>,
@@ -100,6 +101,7 @@ impl Config {
                 .into_owned(),
         };
         let codex_bin = env::var("ATLAS2_CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
+        let codex_sessions_dir = codex_sessions_dir()?;
         let poll_timeout_seconds = env_u64("ATLAS2_POLL_TIMEOUT_SECONDS", 30)?;
         let max_directory_entries = env_usize("ATLAS2_MAX_DIRECTORY_ENTRIES", 20)?;
         let workspace_additional_writable_dirs =
@@ -127,6 +129,7 @@ impl Config {
             telegram_api_base,
             database_url,
             codex_bin,
+            codex_sessions_dir,
             poll_timeout_seconds,
             max_directory_entries,
             workspace_additional_writable_dirs: additional_dirs,
@@ -325,6 +328,27 @@ fn project_dirs() -> AppResult<ProjectDirs> {
     ProjectDirs::from("", "", "atlas2").ok_or_else(|| {
         AppError::Config("could not determine a home directory for atlas2 paths".into())
     })
+}
+
+/// Resolves the Codex rollout sessions directory. Honors an explicit override,
+/// then `$CODEX_HOME/sessions`, and finally `~/.codex/sessions` (the Codex CLI
+/// default that Atlas2 and the laptop CLI share).
+fn codex_sessions_dir() -> AppResult<PathBuf> {
+    if let Ok(value) = env::var("ATLAS2_CODEX_SESSIONS_DIR")
+        && !value.is_empty()
+    {
+        return Ok(PathBuf::from(value));
+    }
+    let codex_home = match env::var("CODEX_HOME") {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        _ => BaseDirs::new()
+            .ok_or_else(|| {
+                AppError::Config("could not determine a home directory for the Codex sessions path".into())
+            })?
+            .home_dir()
+            .join(".codex"),
+    };
+    Ok(codex_home.join("sessions"))
 }
 
 /// Per-user config directory (`~/.config/atlas2` on Linux). Holds credentials

@@ -131,6 +131,16 @@ impl ClaudeProvider {
                         "claude exited before the turn completed".into(),
                     ));
                 };
+                // In plan mode a proposed plan ends the turn: present it and wait
+                // for the user's Implement/Add-details choice. Otherwise Claude —
+                // whose `ExitPlanMode` is auto-denied in headless mode — keeps
+                // looping, repeatedly re-proposing the plan and failing tool calls
+                // against the read-only sandbox. Stopping here makes plan turns
+                // one-shot, matching Codex. The session resumes cleanly for the
+                // follow-up implementation turn (verified: a killed plan turn does
+                // not corrupt `--resume`).
+                let plan_finished =
+                    mode == PromptMode::Plan && matches!(event, ProviderEvent::PlanCompleted { .. });
                 match &event {
                     ProviderEvent::ThreadStarted {
                         thread_id,
@@ -147,6 +157,10 @@ impl ClaudeProvider {
                     _ => {}
                 }
                 on_event(event.clone())?;
+                if plan_finished {
+                    result.completed = true;
+                    break;
+                }
                 if result.completed || result.interrupted || result.failure.is_some() {
                     break;
                 }
@@ -819,6 +833,64 @@ mod tests {
         let written = std::fs::read_to_string(temp.path().join("hello.txt"))
             .expect("hello.txt should have been written under bypassPermissions");
         assert!(written.contains("hi"));
+    }
+
+    /// End-to-end check that a plan turn is one-shot: it stops at the first plan
+    /// (one `PlanCompleted`), completes, and leaves the workspace unmodified —
+    /// rather than looping and trying to implement against the read-only sandbox.
+    /// Ignored by default (spawns the real `claude` binary). Run with:
+    /// `cargo test --bin atlas2 -- --ignored claude_plan_turn_is_one_shot`
+    #[tokio::test]
+    #[ignore]
+    async fn claude_plan_turn_is_one_shot() {
+        use crate::domain::{ProviderKind, SessionId, SessionStatus, WorkspacePath};
+        use chrono::Utc;
+        use std::sync::{Arc, Mutex};
+
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("main.rs");
+        std::fs::write(&file, "fn main() { println!(\"hi\"); }\n").unwrap();
+        let original = std::fs::read_to_string(&file).unwrap();
+
+        let provider = ClaudeProvider::new("claude".into(), Vec::new());
+        let session = SessionRecord {
+            session_id: SessionId::new(),
+            chat_id: crate::domain::TelegramChatId(1),
+            workspace_path: WorkspacePath(temp.path().to_string_lossy().into_owned()),
+            provider: ProviderKind::Claude,
+            provider_thread_id: None,
+            resume_cursor_json: None,
+            status: SessionStatus::Ready,
+            last_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let plan_count = Arc::new(Mutex::new(0usize));
+        let plan_count_cb = plan_count.clone();
+        let result = provider
+            .run_turn(
+                &session,
+                "Make a short plan to add a goodbye() function to main.rs, then implement it.",
+                PromptMode::Plan,
+                Some("sonnet"),
+                None,
+                false,
+                move |event| {
+                    if matches!(event, ProviderEvent::PlanCompleted { .. }) {
+                        *plan_count_cb.lock().unwrap() += 1;
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .expect("plan turn runs");
+
+        assert!(result.completed, "plan turn should complete: {result:?}");
+        // One-shot: exactly one plan, and the turn stopped there.
+        assert_eq!(*plan_count.lock().unwrap(), 1, "expected exactly one plan");
+        // Plan mode is read-only: the file must be untouched.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
     }
 
     #[test]

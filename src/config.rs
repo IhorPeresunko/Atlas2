@@ -102,9 +102,9 @@ impl Config {
                 .to_string_lossy()
                 .into_owned(),
         };
-        let codex_bin = env::var("ATLAS2_CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
+        let codex_bin = codex_bin();
         let codex_sessions_dir = codex_sessions_dir()?;
-        let claude_bin = env::var("ATLAS2_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+        let claude_bin = claude_bin();
         let claude_sessions_dir = claude_sessions_dir()?;
         let poll_timeout_seconds = env_u64("ATLAS2_POLL_TIMEOUT_SECONDS", 30)?;
         let max_directory_entries = env_usize("ATLAS2_MAX_DIRECTORY_ENTRIES", 20)?;
@@ -143,6 +143,18 @@ impl Config {
             stt_api_key,
         })
     }
+}
+
+/// The `codex` executable Atlas2 drives, overridable via `ATLAS2_CODEX_BIN`.
+/// Shared by the running server and `atlas2 status` so both agree on what they
+/// look for.
+pub fn codex_bin() -> String {
+    env::var("ATLAS2_CODEX_BIN").unwrap_or_else(|_| "codex".to_string())
+}
+
+/// The `claude` executable Atlas2 drives, overridable via `ATLAS2_CLAUDE_BIN`.
+pub fn claude_bin() -> String {
+    env::var("ATLAS2_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string())
 }
 
 fn load_telegram_bot_token() -> AppResult<String> {

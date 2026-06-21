@@ -1,6 +1,6 @@
 use std::{
-    fs,
-    path::PathBuf,
+    env, fs,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
@@ -218,13 +218,127 @@ pub fn stop() -> AppResult<()> {
     Ok(())
 }
 
-/// Reports whether the background Atlas2 process is running.
-pub fn status() -> AppResult<()> {
-    match running_pid()? {
-        Some(pid) => println!("Atlas2 is running (pid {pid})."),
-        None => println!("Atlas2 is not running."),
+/// A single line in the `atlas2 status` report: a presence flag, an aligned
+/// label, and a human-readable detail.
+struct StatusLine {
+    present: bool,
+    label: &'static str,
+    detail: String,
+}
+
+impl StatusLine {
+    fn on(label: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            present: true,
+            label,
+            detail: detail.into(),
+        }
     }
+
+    fn off(label: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            present: false,
+            label,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Reports whether the background Atlas2 process is running, the state of the
+/// surrounding configuration (Telegram token, coding agents, speech-to-text),
+/// and the build this binary was cut from.
+pub fn status() -> AppResult<()> {
+    let daemon = match running_pid()? {
+        Some(pid) => StatusLine::on("Daemon", format!("running (pid {pid})")),
+        None => StatusLine::off("Daemon", "not running (start with `atlas2 start`)"),
+    };
+
+    let telegram = match config::stored_telegram_bot_token()? {
+        Some(_) => StatusLine::on("Telegram", "bot token configured"),
+        None => StatusLine::off("Telegram", "no bot token (set with `atlas2 set bottoken <value>`)"),
+    };
+
+    let codex = match locate_executable(&config::codex_bin()) {
+        Some(path) => StatusLine::on("Codex", format!("connected ({})", path.display())),
+        None => StatusLine::off("Codex", "not installed"),
+    };
+
+    let claude = match locate_executable(&config::claude_bin()) {
+        Some(path) => StatusLine::on("Claude", format!("connected ({})", path.display())),
+        None => StatusLine::off("Claude", "not installed"),
+    };
+
+    let speech = match config::stored_stt_api_key()? {
+        Some(_) => StatusLine::on("Speech-to-text", "ElevenLabs key configured"),
+        None => StatusLine::off("Speech-to-text", "disabled (no API key)"),
+    };
+
+    print!(
+        "{}",
+        render_status(
+            &[daemon, telegram, codex, claude, speech],
+            env!("CARGO_PKG_VERSION"),
+        )
+    );
     Ok(())
+}
+
+/// Renders the status lines into the aligned block printed by `atlas2 status`,
+/// footed with the version and build origin. Pure so the layout can be unit
+/// tested without touching the filesystem.
+fn render_status(lines: &[StatusLine], version: &str) -> String {
+    let width = lines.iter().map(|line| line.label.len()).max().unwrap_or(0);
+    let mut out = String::from("\n");
+    for line in lines {
+        let mark = if line.present { '✓' } else { '✗' };
+        out.push_str(&format!(
+            "  {mark}  {:<width$}  {}\n",
+            line.label, line.detail
+        ));
+    }
+    out.push_str(&format!("\n  atlas2 {version} · built in prague\n\n"));
+    out
+}
+
+/// Finds `program` the way a shell would: an explicit path (absolute, or
+/// relative with a directory component) is checked directly, while a bare name
+/// is searched across `PATH`. Returns the resolved path when it points at a
+/// runnable file.
+fn locate_executable(program: &str) -> Option<PathBuf> {
+    let path_dirs: Vec<PathBuf> = env::var_os("PATH")
+        .map(|paths| env::split_paths(&paths).collect())
+        .unwrap_or_default();
+    find_executable(program, &path_dirs, is_executable_file)
+}
+
+/// Pure core of [`locate_executable`]: `is_exec` reports whether a candidate is
+/// a runnable file, injected so the search can be unit tested without real
+/// files on disk.
+fn find_executable(
+    program: &str,
+    path_dirs: &[PathBuf],
+    is_exec: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let candidate = Path::new(program);
+    let has_dir_component = candidate
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty());
+    if candidate.is_absolute() || has_dir_component {
+        return is_exec(candidate).then(|| candidate.to_path_buf());
+    }
+    path_dirs
+        .iter()
+        .map(|dir| dir.join(program))
+        .find(|path| is_exec(path))
+}
+
+/// Whether `path` is an existing file with at least one executable bit set.
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match fs::metadata(path) {
+        Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
 }
 
 /// Downloads and installs the latest release in place using the dist install
@@ -277,7 +391,48 @@ pub async fn upgrade() -> AppResult<()> {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::clean_exe_path;
+    use super::{StatusLine, clean_exe_path, find_executable, render_status};
+
+    #[test]
+    fn find_executable_searches_path_for_bare_name() {
+        let dirs = [PathBuf::from("/opt/bin"), PathBuf::from("/usr/local/bin")];
+        let found = find_executable("codex", &dirs, |path| {
+            path == Path::new("/usr/local/bin/codex")
+        });
+        assert_eq!(found, Some(PathBuf::from("/usr/local/bin/codex")));
+    }
+
+    #[test]
+    fn find_executable_returns_none_when_absent_from_path() {
+        let dirs = [PathBuf::from("/opt/bin")];
+        let found = find_executable("claude", &dirs, |_| false);
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn find_executable_checks_explicit_path_directly() {
+        // A path with a directory component is not searched across PATH.
+        let found = find_executable("/custom/codex", &[], |path| {
+            path == Path::new("/custom/codex")
+        });
+        assert_eq!(found, Some(PathBuf::from("/custom/codex")));
+    }
+
+    #[test]
+    fn render_status_aligns_labels_and_foots_with_build() {
+        let report = render_status(
+            &[
+                StatusLine::on("Daemon", "running (pid 7)"),
+                StatusLine::off("Speech-to-text", "disabled"),
+            ],
+            "1.2.3",
+        );
+        // The shorter label is padded to the width of the longest one, so the
+        // details line up in a column.
+        assert!(report.contains("  ✓  Daemon          running (pid 7)\n"));
+        assert!(report.contains("  ✗  Speech-to-text  disabled\n"));
+        assert!(report.contains("atlas2 1.2.3 · built in prague"));
+    }
 
     #[test]
     fn clean_exe_path_returns_existing_path_unchanged() {

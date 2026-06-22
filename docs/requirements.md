@@ -10,7 +10,7 @@
 ## Telegram UX
 
 - The primary interface is a Telegram group.
-- The bot must be added to the group and group admins are the only users allowed to create sessions or resolve approvals.
+- Access is owner-gated: a single owner (Telegram user ID) is the only user who may add the bot to a group or DM it. The owner is established automatically as the first user to DM the bot or add it to a group (trust-on-first-use), since the Bot API does not expose a bot's creator; it can also be pinned explicitly via config/env, which overrides and disables auto-claim. A group becomes authorized only when the owner adds the bot to it (or runs `/activate`); the bot leaves any group added by a non-owner. Within an authorized group, every member has full access (create sessions, resolve approvals, stop turns). While unclaimed the bot is inert.
 - `/start` and `/help` show available commands.
 - `/new` first shows historic project buttons (per group), plus an `Add new project` button.
 - Tapping `Add new project` starts the folder-selection flow inside the current group.
@@ -18,7 +18,7 @@
 - `/plan <prompt>` runs a plan-only Codex turn for the current session.
 - Any non-command text in a group with an active session is treated as a prompt for Codex.
 - Telegram `voice` messages in a group with an active session should be transcribed and treated as prompts for Codex when STT is enabled.
-- Live turns should expose a Telegram `Stop` button so admins can interrupt them in-place.
+- Live turns should expose a Telegram `Stop` button so members of an authorized chat can interrupt them in-place.
 
 ## Folder Selection
 
@@ -58,8 +58,8 @@
 - Atlas2 should surface Codex approval/action requests as Telegram buttons whenever the Codex event stream exposes them.
 - Atlas2 should surface option-based `request_user_input` prompts, including plan-mode follow-up choices, as Telegram buttons whenever the Codex event stream exposes them.
 - Atlas2 should also surface completed plan follow-up actions as Telegram buttons even when Codex presents them only as plan output rather than an interactive request.
-- Group admins can approve or reject via Telegram buttons.
-- Group admins can also stop a running turn via Telegram buttons.
+- Members of an authorized chat can approve or reject via Telegram buttons.
+- Members of an authorized chat can also stop a running turn via Telegram buttons.
 - Approval decisions must be persisted in SQLite.
 - Invalid, stale, or repeated approval clicks must be rejected safely.
 - Invalid, stale, or repeated interactive-choice clicks must be rejected safely.

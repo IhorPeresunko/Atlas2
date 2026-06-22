@@ -7,7 +7,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, OwnedMutexGuard, mpsc::unbounded_channel};
 
 use crate::{
-    domain::{PromptMode, SessionId, SessionRecord, SessionStatus, TelegramChatId, TelegramUserId},
+    domain::{PromptMode, SessionId, SessionRecord, SessionStatus, TelegramChatId},
     error::{AppError, AppResult},
     provider::ProviderRegistry,
     presentation::{
@@ -20,7 +20,7 @@ use crate::{
     telegram::TelegramApi,
 };
 
-use super::{model::ModelService, require_group_admin};
+use super::model::ModelService;
 
 mod events;
 
@@ -77,10 +77,7 @@ impl<Tg: TelegramApi + 'static> TurnService<Tg> {
         &self,
         session_id: SessionId,
         chat_id: TelegramChatId,
-        user_id: TelegramUserId,
     ) -> AppResult<String> {
-        require_group_admin(&self.telegram, chat_id, user_id).await?;
-
         let session = self.require_active_session(chat_id).await?;
         if session.session_id != session_id {
             return Err(AppError::Validation("turn is no longer active".into()));

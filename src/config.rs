@@ -77,6 +77,10 @@ impl From<CliSttProvider> for SttProvider {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub telegram_bot_token: String,
+    /// Telegram user ID of the bot owner. Only this user may DM the bot or
+    /// authorize a group (by adding the bot or running `/activate`). `None` means
+    /// no owner is configured, in which case the bot is inert (fails closed).
+    pub owner_id: Option<i64>,
     pub telegram_api_base: String,
     pub database_url: String,
     pub codex_bin: String,
@@ -93,6 +97,7 @@ pub struct Config {
 impl Config {
     pub fn load(args: &ServeArgs) -> AppResult<Self> {
         let telegram_bot_token = load_telegram_bot_token()?;
+        let owner_id = load_owner_id()?;
         let telegram_api_base = env::var("ATLAS2_TELEGRAM_API_BASE")
             .unwrap_or_else(|_| "https://api.telegram.org".to_string());
         let database_path = match env::var("ATLAS2_DATABASE_PATH") {
@@ -130,6 +135,7 @@ impl Config {
 
         Ok(Self {
             telegram_bot_token,
+            owner_id,
             telegram_api_base,
             database_url,
             codex_bin,
@@ -186,6 +192,31 @@ pub fn stored_telegram_bot_token() -> AppResult<Option<String>> {
     )
 }
 
+/// Reads the bot owner's Telegram user ID from the environment or the persisted
+/// config file. Returns `None` when unset; the caller treats that as "no owner
+/// configured" and refuses to act on any chat.
+fn load_owner_id() -> AppResult<Option<i64>> {
+    if let Ok(value) = env::var("ATLAS2_OWNER_ID") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(parse_owner_id(trimmed)?));
+        }
+    }
+
+    match read_credential("ATLAS2_OWNER_ID_FILE", "owner_id", "owner Telegram user ID")? {
+        Some(value) => Ok(Some(parse_owner_id(&value)?)),
+        None => Ok(None),
+    }
+}
+
+fn parse_owner_id(value: &str) -> AppResult<i64> {
+    value.trim().parse::<i64>().map_err(|_| {
+        AppError::Config(format!(
+            "owner Telegram user ID must be an integer, got '{value}'"
+        ))
+    })
+}
+
 /// Reads the persisted ElevenLabs API key without prompting, mirroring
 /// [`stored_telegram_bot_token`].
 pub fn stored_stt_api_key() -> AppResult<Option<String>> {
@@ -208,14 +239,23 @@ pub fn set_secret(key: &str, value: &str) -> AppResult<()> {
             credential_path("ATLAS2_STT_API_KEY_FILE", "stt_api_key")?,
             "ElevenLabs API key",
         ),
+        "ownerid" | "owner" => (
+            credential_path("ATLAS2_OWNER_ID_FILE", "owner_id")?,
+            "owner Telegram user ID",
+        ),
         other => {
             return Err(AppError::Config(format!(
-                "unknown config key '{other}'; known keys: bottoken, sttkey"
+                "unknown config key '{other}'; known keys: bottoken, sttkey, ownerid"
             )));
         }
     };
 
     let secret = normalize_secret(value.to_string(), label)?;
+    // The owner ID is not a secret, but it shares the credential-file plumbing.
+    // Validate it parses as an integer so a typo fails at `set` time, not later.
+    if matches!(key, "ownerid" | "owner") {
+        parse_owner_id(&secret)?;
+    }
     persist_secret(&path, &secret, label)?;
     Ok(())
 }

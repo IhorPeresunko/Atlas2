@@ -5,7 +5,7 @@ use crate::{
         AppServices, FolderCallbackResult, ModelCallbackResult, PlanFollowUpCallbackResult,
         UserInputCallbackResult, UserInputTextResult,
     },
-    telegram::{BotCommand, TelegramApi, Update},
+    telegram::{BotCommand, ChatMemberUpdated, TelegramApi, Update},
 };
 
 pub(crate) async fn handle_update<Tg>(services: &AppServices<Tg>, update: Update) -> AppResult<()>
@@ -13,19 +13,75 @@ where
     Tg: TelegramApi + 'static,
 {
     let update_id = update.update_id;
+
+    if let Some(membership) = update.my_chat_member {
+        return handle_my_chat_member(services, update_id, membership).await;
+    }
+
     if let Some(message) = update.message {
         let chat_id = TelegramChatId(message.chat.id);
         let chat_kind = message.chat.kind.clone();
         let chat_title = message.chat.title.clone();
-        services
-            .register_chat(chat_id, &message.chat.kind, message.chat.title.as_deref())
-            .await?;
 
         let user_id = message
             .from
             .as_ref()
             .map(|user| TelegramUserId(user.id))
             .ok_or_else(|| AppError::Validation("message missing sender".into()))?;
+
+        // Trust-on-first-use: while the bot is unclaimed, the first person to DM
+        // it becomes the owner. This is what removes the need to look up your
+        // numeric ID — you just message your own bot once, right after creating it.
+        if chat_kind == "private" && services.try_claim_owner(user_id).await? {
+            tracing::info!(
+                update_id,
+                user_id = user_id.0,
+                "owner claimed via first direct message"
+            );
+            services
+                .telegram
+                .send_message(
+                    chat_id,
+                    "✅ You are now the owner of this bot. Only you can use it and add it to groups. Send /help to get started.",
+                    None,
+                    None,
+                )
+                .await?;
+            return Ok(());
+        }
+
+        // Owner-only activation commands must work before a chat is authorized,
+        // so they are handled ahead of the authorization gate.
+        if let Some(activation) = message.text.as_deref().and_then(parse_activation) {
+            return handle_activation(
+                services,
+                update_id,
+                chat_id,
+                &chat_kind,
+                chat_title.as_deref(),
+                user_id,
+                activation,
+            )
+            .await;
+        }
+
+        // Authorization gate: silently ignore anything from a chat the owner has
+        // not authorized, and any private chat that is not the owner's. This is
+        // the single chokepoint that keeps strangers from driving the agent.
+        if !services.is_authorized(chat_id, &chat_kind, user_id).await? {
+            tracing::warn!(
+                update_id,
+                chat_id = chat_id.0,
+                user_id = user_id.0,
+                chat_kind,
+                "ignoring message from unauthorized chat"
+            );
+            return Ok(());
+        }
+
+        services
+            .register_chat(chat_id, &message.chat.kind, message.chat.title.as_deref())
+            .await?;
 
         if let Some(text) = message.text.clone() {
             tracing::info!(
@@ -122,7 +178,6 @@ where
                         .await?;
                 }
                 IncomingMessage::NewSession => {
-                    services.require_group_admin(chat_id, user_id).await?;
                     // Starting fresh supersedes any in-flight turn for this
                     // chat; cancel it so it does not keep holding the turn lock.
                     services.turns.cancel_active_turn(chat_id).await;
@@ -133,7 +188,6 @@ where
                         .await?;
                 }
                 IncomingMessage::Resume => {
-                    services.require_group_admin(chat_id, user_id).await?;
                     let (text, markup) = services.resume.begin_resume(chat_id).await?;
                     services
                         .telegram
@@ -216,9 +270,7 @@ where
                         .await?;
                 }
                 IncomingMessage::Yolo(desired) => {
-                    let text = services
-                        .set_skip_permissions(chat_id, user_id, desired)
-                        .await?;
+                    let text = services.set_skip_permissions(chat_id, desired).await?;
                     services
                         .telegram
                         .send_message(chat_id, &text, None, None)
@@ -298,7 +350,26 @@ where
             return Ok(());
         };
         let chat_id = TelegramChatId(message.chat.id);
+        let chat_kind = message.chat.kind.clone();
         let user_id = TelegramUserId(callback.from.id);
+
+        // Same authorization gate as messages: a callback from an unauthorized
+        // chat (or a non-owner DM) must never reach a handler.
+        if !services.is_authorized(chat_id, &chat_kind, user_id).await? {
+            tracing::warn!(
+                update_id,
+                chat_id = chat_id.0,
+                user_id = user_id.0,
+                chat_kind,
+                "ignoring callback from unauthorized chat"
+            );
+            services
+                .telegram
+                .answer_callback_query(&callback.id, "Not authorized.", true)
+                .await?;
+            return Ok(());
+        }
+
         let Some(data) = callback.data.as_deref() else {
             return Ok(());
         };
@@ -331,7 +402,7 @@ where
                 crate::domain::SessionId(uuid::Uuid::parse_str(id).map_err(|error| {
                     AppError::Validation(format!("invalid session ID in callback: {error}"))
                 })?);
-            services.turns.stop_turn(session_id, chat_id, user_id).await
+            services.turns.stop_turn(session_id, chat_id).await
         } else if let Some(rest) = data.strip_prefix("user-input-answer:") {
             let mut parts = rest.split(':');
             let request_id = parts
@@ -479,7 +550,7 @@ where
             services.turns.cancel_active_turn(chat_id).await;
             let result = services
                 .resume
-                .handle_resume_callback(chat_id, user_id, thread_id)
+                .handle_resume_callback(chat_id, thread_id)
                 .await?;
             services
                 .telegram
@@ -500,7 +571,7 @@ where
         } else {
             match services
                 .folder
-                .handle_folder_callback(chat_id, user_id, data)
+                .handle_folder_callback(chat_id, data)
                 .await?
             {
                 FolderCallbackResult::Render(text, markup) => {
@@ -543,6 +614,194 @@ where
     Ok(())
 }
 
+/// Reacts to a change in the bot's own membership in a chat. This is how the
+/// "only the owner can add the bot to a group" rule is enforced: the bot leaves
+/// any group it was added to by someone other than the owner, and auto-authorizes
+/// groups the owner adds it to.
+async fn handle_my_chat_member<Tg>(
+    services: &AppServices<Tg>,
+    update_id: i64,
+    membership: ChatMemberUpdated,
+) -> AppResult<()>
+where
+    Tg: TelegramApi + 'static,
+{
+    let chat_id = TelegramChatId(membership.chat.id);
+    let chat_kind = membership.chat.kind.clone();
+    let chat_title = membership.chat.title.clone();
+    let actor = TelegramUserId(membership.from.id);
+    let bot_present = membership.new_chat_member.is_present();
+
+    // Private chats are authorized per-message by owner identity, not by a stored
+    // flag, so membership changes there need no action.
+    if chat_kind == "private" {
+        return Ok(());
+    }
+
+    // Bot left or was removed: drop authorization so any re-add must be
+    // re-authorized by the owner.
+    if !bot_present {
+        services.deauthorize_chat(chat_id).await?;
+        return Ok(());
+    }
+
+    let owner = match services.owner_id().await? {
+        Some(owner) => owner,
+        None => {
+            // Unclaimed: the first person to add the bot anywhere becomes the
+            // owner, and the group they added it to is authorized (trust-on-
+            // first-use), mirroring claim-via-DM.
+            services.try_claim_owner(actor).await?;
+            services
+                .authorize_chat(chat_id, &chat_kind, chat_title.as_deref())
+                .await?;
+            tracing::info!(
+                update_id,
+                chat_id = chat_id.0,
+                actor = actor.0,
+                "owner claimed via group add; chat authorized"
+            );
+            let _ = services
+                .telegram
+                .send_message(
+                    chat_id,
+                    "✅ You are now the owner of this bot, and this group is active. Everyone here can use it — send /new to start.",
+                    None,
+                    None,
+                )
+                .await;
+            return Ok(());
+        }
+    };
+
+    if actor.0 == owner {
+        services
+            .authorize_chat(chat_id, &chat_kind, chat_title.as_deref())
+            .await?;
+        tracing::info!(
+            update_id,
+            chat_id = chat_id.0,
+            "owner added bot to group; chat authorized"
+        );
+        let _ = services
+            .telegram
+            .send_message(
+                chat_id,
+                "Atlas2 activated by the owner. Everyone in this group can use it now — send /new to start.",
+                None,
+                None,
+            )
+            .await;
+    } else {
+        tracing::warn!(
+            update_id,
+            chat_id = chat_id.0,
+            actor = actor.0,
+            "non-owner added bot to a group; leaving"
+        );
+        let _ = services
+            .telegram
+            .send_message(
+                chat_id,
+                "This bot is private. Only its owner can add it to groups. Leaving.",
+                None,
+                None,
+            )
+            .await;
+        services.deauthorize_chat(chat_id).await?;
+        services.telegram.leave_chat(chat_id).await?;
+    }
+
+    Ok(())
+}
+
+/// Owner-only `/activate` and `/deactivate` for the current chat. Used to enable
+/// the bot in groups it is already a member of (e.g. after upgrading), and to
+/// revoke a group later.
+async fn handle_activation<Tg>(
+    services: &AppServices<Tg>,
+    update_id: i64,
+    chat_id: TelegramChatId,
+    chat_kind: &str,
+    chat_title: Option<&str>,
+    user_id: TelegramUserId,
+    activation: Activation,
+) -> AppResult<()>
+where
+    Tg: TelegramApi + 'static,
+{
+    if !services.is_owner(user_id).await? {
+        tracing::warn!(
+            update_id,
+            chat_id = chat_id.0,
+            user_id = user_id.0,
+            "non-owner attempted an activation command"
+        );
+        // Only acknowledge in chats that are already authorized, so the bot stays
+        // silent to strangers in chats it has not been activated for.
+        if services.is_authorized(chat_id, chat_kind, user_id).await? {
+            services
+                .telegram
+                .send_message(
+                    chat_id,
+                    "Only the bot owner can activate or deactivate this chat.",
+                    None,
+                    None,
+                )
+                .await?;
+        }
+        return Ok(());
+    }
+
+    match activation {
+        Activation::Activate => {
+            services
+                .authorize_chat(chat_id, chat_kind, chat_title)
+                .await?;
+            services
+                .telegram
+                .send_message(
+                    chat_id,
+                    "Atlas2 is now active in this chat. Everyone here can use it — send /new to start.",
+                    None,
+                    None,
+                )
+                .await?;
+        }
+        Activation::Deactivate => {
+            services.deauthorize_chat(chat_id).await?;
+            services
+                .telegram
+                .send_message(
+                    chat_id,
+                    "Atlas2 is now deactivated in this chat. Send /activate to re-enable it.",
+                    None,
+                    None,
+                )
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Activation {
+    Activate,
+    Deactivate,
+}
+
+/// Recognizes the owner-only activation commands, which are routed before the
+/// authorization gate. Returns `None` for everything else.
+fn parse_activation(text: &str) -> Option<Activation> {
+    let (command, _) = split_command(text);
+    match command {
+        "/activate" => Some(Activation::Activate),
+        "/deactivate" => Some(Activation::Deactivate),
+        _ => None,
+    }
+}
+
 fn incoming_message_name(message: &IncomingMessage<'_>) -> &'static str {
     match message {
         IncomingMessage::Help => "help",
@@ -580,6 +839,8 @@ pub(crate) fn bot_commands() -> Vec<BotCommand> {
         BotCommand::new("plan", "Run a read-only planning turn"),
         BotCommand::new("model", "Pick or set the model"),
         BotCommand::new("yolo", "Toggle skipping Claude permission prompts (dangerous)"),
+        BotCommand::new("activate", "Owner only: enable Atlas2 in this chat"),
+        BotCommand::new("deactivate", "Owner only: disable Atlas2 in this chat"),
     ]
 }
 
@@ -729,6 +990,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_activation_commands() {
+        use super::{Activation, parse_activation};
+        assert_eq!(parse_activation("/activate"), Some(Activation::Activate));
+        assert_eq!(
+            parse_activation("/activate@atlas2codingbot"),
+            Some(Activation::Activate)
+        );
+        assert_eq!(
+            parse_activation("/deactivate"),
+            Some(Activation::Deactivate)
+        );
+        assert_eq!(parse_activation("/new"), None);
+        assert_eq!(parse_activation("hello"), None);
+    }
+
+    #[test]
     fn parses_plain_text_as_prompt() {
         assert_eq!(
             parse_message_text("hello world"),
@@ -751,7 +1028,8 @@ mod tests {
         assert_eq!(
             commands,
             vec![
-                "start", "help", "new", "resume", "sessions", "plan", "model", "yolo"
+                "start", "help", "new", "resume", "sessions", "plan", "model", "yolo", "activate",
+                "deactivate"
             ]
         );
     }

@@ -106,6 +106,10 @@ pub struct ChatBinding {
     pub active_session_id: Option<SessionId>,
     pub chat_kind: String,
     pub title: Option<String>,
+    /// Whether the bot owner has authorized this chat. Group chats become
+    /// authorized when the owner adds the bot or runs `/activate`; private chats
+    /// are authorized implicitly for the owner only and do not rely on this flag.
+    pub authorized: bool,
     /// Per-chat model preference; `None` means use the provider's default.
     pub model: Option<String>,
     /// Per-chat reasoning effort; `None` means use the model's default effort.

@@ -49,7 +49,8 @@ impl Storage {
                 active_session_id TEXT,
                 model TEXT,
                 reasoning_effort TEXT,
-                dangerously_skip_permissions INTEGER NOT NULL DEFAULT 0
+                dangerously_skip_permissions INTEGER NOT NULL DEFAULT 0,
+                authorized INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS sessions (
@@ -63,6 +64,11 @@ impl Storage {
                 last_error TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS folder_browse_state (
@@ -121,6 +127,8 @@ impl Storage {
         self.ensure_chat_column("model", "TEXT").await?;
         self.ensure_chat_column("reasoning_effort", "TEXT").await?;
         self.ensure_chat_column("dangerously_skip_permissions", "INTEGER NOT NULL DEFAULT 0")
+            .await?;
+        self.ensure_chat_column("authorized", "INTEGER NOT NULL DEFAULT 0")
             .await?;
         Ok(())
     }
@@ -189,7 +197,7 @@ impl Storage {
         let row = sqlx::query(
             r#"
             SELECT chat_id, active_session_id, chat_kind, title, model, reasoning_effort,
-                   dangerously_skip_permissions
+                   dangerously_skip_permissions, authorized
             FROM chats
             WHERE chat_id = ?1
             "#,
@@ -286,6 +294,64 @@ impl Storage {
         )
         .bind(chat_id.0)
         .bind(i64::from(skip))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Reads the owner's Telegram user ID claimed at runtime (trust-on-first-use),
+    /// if one has been claimed. An explicit config/env owner takes precedence over
+    /// this and is resolved by the caller.
+    pub async fn get_owner_id(&self) -> AppResult<Option<i64>> {
+        let row = sqlx::query("SELECT value FROM app_settings WHERE key = 'owner_id'")
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => {
+                let value: String = row.get("value");
+                let parsed = value.parse::<i64>().map_err(|error| {
+                    AppError::Validation(format!("stored owner_id '{value}' is not an integer: {error}"))
+                })?;
+                Ok(Some(parsed))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persists the claimed owner. Used once, the first time someone DMs the bot
+    /// or adds it to a group while it is unclaimed.
+    pub async fn set_owner_id(&self, user_id: i64) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO app_settings (key, value)
+            VALUES ('owner_id', ?1)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+        )
+        .bind(user_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Sets whether the bot owner has authorized this chat. Upserts so a chat can
+    /// be authorized (e.g. via the owner adding the bot) before any message from
+    /// it has been registered.
+    pub async fn set_chat_authorized(
+        &self,
+        chat_id: TelegramChatId,
+        authorized: bool,
+    ) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO chats (chat_id, chat_kind, authorized)
+            VALUES (?1, 'unknown', ?2)
+            ON CONFLICT(chat_id) DO UPDATE SET authorized = excluded.authorized
+            "#,
+        )
+        .bind(chat_id.0)
+        .bind(i64::from(authorized))
         .execute(&self.pool)
         .await?;
 
@@ -893,6 +959,7 @@ fn map_chat_binding(row: sqlx::sqlite::SqliteRow) -> AppResult<ChatBinding> {
         model: row.get::<Option<String>, _>("model"),
         reasoning_effort: row.get::<Option<String>, _>("reasoning_effort"),
         dangerously_skip_permissions: row.get::<i64, _>("dangerously_skip_permissions") != 0,
+        authorized: row.get::<i64, _>("authorized") != 0,
     })
 }
 
@@ -1045,6 +1112,7 @@ mod tests {
                 active_session_id: Some(session.session_id.clone()),
                 chat_kind: "supergroup".into(),
                 title: Some("Atlas".into()),
+                authorized: false,
                 model: None,
                 reasoning_effort: None,
                 dangerously_skip_permissions: false,
@@ -1071,6 +1139,44 @@ mod tests {
         storage.set_chat_skip_permissions(chat_id, false).await.unwrap();
         let chat = storage.get_chat(chat_id).await.unwrap().unwrap();
         assert!(!chat.dangerously_skip_permissions);
+    }
+
+    #[tokio::test]
+    async fn stores_and_reads_claimed_owner() {
+        let storage = Storage::connect("sqlite::memory:").await.unwrap();
+
+        assert_eq!(storage.get_owner_id().await.unwrap(), None);
+
+        storage.set_owner_id(12345).await.unwrap();
+        assert_eq!(storage.get_owner_id().await.unwrap(), Some(12345));
+
+        // Idempotent overwrite (last writer wins).
+        storage.set_owner_id(67890).await.unwrap();
+        assert_eq!(storage.get_owner_id().await.unwrap(), Some(67890));
+    }
+
+    #[tokio::test]
+    async fn stores_and_toggles_chat_authorization() {
+        let storage = Storage::connect("sqlite::memory:").await.unwrap();
+        let chat_id = TelegramChatId(77);
+
+        // A chat the owner authorizes before it has ever sent a message: the
+        // setter upserts the row.
+        storage.set_chat_authorized(chat_id, true).await.unwrap();
+        let chat = storage.get_chat(chat_id).await.unwrap().unwrap();
+        assert!(chat.authorized);
+
+        // upsert_chat (on every incoming message) must not clobber the flag.
+        storage
+            .upsert_chat(chat_id, "supergroup", Some("Team"))
+            .await
+            .unwrap();
+        let chat = storage.get_chat(chat_id).await.unwrap().unwrap();
+        assert!(chat.authorized);
+
+        storage.set_chat_authorized(chat_id, false).await.unwrap();
+        let chat = storage.get_chat(chat_id).await.unwrap().unwrap();
+        assert!(!chat.authorized);
     }
 
     #[tokio::test]

@@ -6,15 +6,13 @@
 //! history is read from the reader matching the session's provider.
 
 use crate::{
-    domain::{TelegramChatId, TelegramUserId, ThreadId},
+    domain::{TelegramChatId, ThreadId},
     error::{AppError, AppResult},
     presentation::{render_resume_prompt, render_resume_transcript, resume_threads_markup},
     provider::ThreadReaderRegistry,
     storage::Storage,
-    telegram::{InlineKeyboardMarkup, TelegramApi},
+    telegram::InlineKeyboardMarkup,
 };
-
-use super::require_group_admin;
 
 const RESUME_THREAD_LIMIT: usize = 10;
 const RESUME_TRANSCRIPT_MESSAGES: usize = 10;
@@ -25,19 +23,14 @@ pub struct ResumeCallbackResult {
 }
 
 #[derive(Clone)]
-pub struct ResumeService<Tg: TelegramApi> {
+pub struct ResumeService {
     storage: Storage,
-    telegram: Tg,
     readers: ThreadReaderRegistry,
 }
 
-impl<Tg: TelegramApi> ResumeService<Tg> {
-    pub fn new(storage: Storage, telegram: Tg, readers: ThreadReaderRegistry) -> Self {
-        Self {
-            storage,
-            telegram,
-            readers,
-        }
+impl ResumeService {
+    pub fn new(storage: Storage, readers: ThreadReaderRegistry) -> Self {
+        Self { storage, readers }
     }
 
     /// Lists the recent threads sharing the active session's workspace, read from
@@ -75,11 +68,8 @@ impl<Tg: TelegramApi> ResumeService<Tg> {
     pub async fn handle_resume_callback(
         &self,
         chat_id: TelegramChatId,
-        user_id: TelegramUserId,
         thread_id_raw: &str,
     ) -> AppResult<ResumeCallbackResult> {
-        require_group_admin(&self.telegram, chat_id, user_id).await?;
-
         let session = self
             .storage
             .get_active_session_for_chat(chat_id)
@@ -127,7 +117,6 @@ mod tests {
     use super::*;
     use crate::domain::{ProviderKind, SessionId, SessionRecord, SessionStatus, WorkspacePath};
     use crate::provider::CodexThreadReader;
-    use crate::telegram::TelegramClient;
     use chrono::Utc;
     use std::collections::HashMap;
     use std::fs as std_fs;
@@ -198,7 +187,6 @@ mod tests {
         let temp = tempdir().unwrap();
         let service = ResumeService::new(
             storage,
-            TelegramClient::new("http://127.0.0.1:9", "token"),
             codex_readers(CodexThreadReader::new(temp.path().to_path_buf())),
         );
 
@@ -218,7 +206,6 @@ mod tests {
 
         let service = ResumeService::new(
             storage,
-            TelegramClient::new("http://127.0.0.1:9", "token"),
             codex_readers(CodexThreadReader::new(temp.path().to_path_buf())),
         );
 
@@ -243,7 +230,6 @@ mod tests {
 
         let service = ResumeService::new(
             storage,
-            TelegramClient::new("http://127.0.0.1:9", "token"),
             codex_readers(CodexThreadReader::new(temp.path().to_path_buf())),
         );
 

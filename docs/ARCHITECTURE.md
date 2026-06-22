@@ -56,7 +56,7 @@ Atlas2 is a single-process Rust service that connects Telegram groups to Codex C
 - `services`
   - Owns session lifecycle, approval decisions, folder-browser state transitions, and prompt orchestration.
 - `telegram`
-  - Owns Bot API transport, long polling, callback answers, admin lookup, and message send/edit operations.
+  - Owns Bot API transport, long polling (including `my_chat_member` membership updates), callback answers, leaving unauthorized groups, and message send/edit operations.
 - `provider`
   - Owns the provider-agnostic seam every other subsystem depends on: the
     object-safe `Provider` trait (run/stop a turn, resolve approvals and
@@ -113,7 +113,8 @@ SQLite currently stores:
 - Approval requests are posted as separate messages with inline buttons.
 - Option-based `request_user_input` prompts are rendered as sequential Telegram button messages; each click records one answer and advances to the next question until the full response is sent back to Codex.
 - After a plan-mode turn produces a complete proposed plan, Atlas2 posts follow-up buttons. `Implement` starts a normal execution turn using a synthetic implementation prompt from the saved plan, while `Add details` treats the next plain Telegram message as plan refinement input.
-- Only Telegram group admins may create sessions, resolve approvals, or stop a running turn.
+- Access is owner-gated at ingress: messages and callbacks are processed only for the owner (in DMs) or for groups the owner authorized (by adding the bot, which is detected via `my_chat_member`, or via `/activate`). The bot leaves any group a non-owner adds it to. Within an authorized chat there is no further per-user gating — every member may create sessions, resolve approvals, or stop a running turn.
+- Ownership is resolved as: an explicit `ATLAS2_OWNER_ID`/config value if present, otherwise an owner claimed at runtime and persisted in `app_settings`. The claim is trust-on-first-use — the first user to DM the bot or add it to a group becomes the owner — because the Bot API exposes no creator. The claim is a no-op once an owner exists, so it cannot be used for takeover.
 
 ## Provider Integration Model
 

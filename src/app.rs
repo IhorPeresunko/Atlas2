@@ -26,6 +26,12 @@ impl App {
         let config = Config::load(args)?;
         ensure_database_parent_dir(&config.database_url)?;
         let storage = Storage::connect(&config.database_url).await?;
+        if config.owner_id.is_none() && storage.get_owner_id().await?.is_none() {
+            tracing::info!(
+                "no owner yet: the first person to DM this bot or add it to a group becomes \
+                 its owner (or set ATLAS2_OWNER_ID to pin it explicitly)"
+            );
+        }
         storage.mark_interrupted_sessions_failed().await?;
         let telegram = TelegramClient::new(&config.telegram_api_base, &config.telegram_bot_token);
         telegram

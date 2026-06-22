@@ -5,25 +5,17 @@ use crate::{
     error::{AppError, AppResult},
     provider::ProviderRegistry,
     storage::Storage,
-    telegram::TelegramApi,
 };
 
-use super::require_group_admin;
-
 #[derive(Clone)]
-pub struct ApprovalService<Tg: TelegramApi> {
+pub struct ApprovalService {
     storage: Storage,
-    telegram: Tg,
     providers: ProviderRegistry,
 }
 
-impl<Tg: TelegramApi> ApprovalService<Tg> {
-    pub fn new(storage: Storage, telegram: Tg, providers: ProviderRegistry) -> Self {
-        Self {
-            storage,
-            telegram,
-            providers,
-        }
+impl ApprovalService {
+    pub fn new(storage: Storage, providers: ProviderRegistry) -> Self {
+        Self { storage, providers }
     }
 
     pub async fn resolve_approval(
@@ -33,8 +25,6 @@ impl<Tg: TelegramApi> ApprovalService<Tg> {
         user_id: TelegramUserId,
         approved: bool,
     ) -> AppResult<String> {
-        require_group_admin(&self.telegram, chat_id, user_id).await?;
-
         let approval = self
             .storage
             .get_pending_approval(&approval_id)

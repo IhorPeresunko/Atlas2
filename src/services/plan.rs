@@ -5,10 +5,7 @@ use crate::{
     domain::{PlanFollowUpId, PlanFollowUpStatus, TelegramChatId, TelegramUserId},
     error::{AppError, AppResult},
     storage::Storage,
-    telegram::TelegramApi,
 };
-
-use super::require_group_admin;
 
 pub enum PlanFollowUpCallbackResult {
     Replace(String),
@@ -16,14 +13,13 @@ pub enum PlanFollowUpCallbackResult {
 }
 
 #[derive(Clone)]
-pub struct PlanService<Tg: TelegramApi> {
+pub struct PlanService {
     storage: Storage,
-    telegram: Tg,
 }
 
-impl<Tg: TelegramApi> PlanService<Tg> {
-    pub fn new(storage: Storage, telegram: Tg) -> Self {
-        Self { storage, telegram }
+impl PlanService {
+    pub fn new(storage: Storage) -> Self {
+        Self { storage }
     }
 
     pub async fn resolve_plan_follow_up_implement(
@@ -32,8 +28,6 @@ impl<Tg: TelegramApi> PlanService<Tg> {
         chat_id: TelegramChatId,
         user_id: TelegramUserId,
     ) -> AppResult<PlanFollowUpCallbackResult> {
-        require_group_admin(&self.telegram, chat_id, user_id).await?;
-
         let follow_up = self
             .storage
             .get_pending_plan_follow_up(&follow_up_id)
@@ -71,8 +65,6 @@ impl<Tg: TelegramApi> PlanService<Tg> {
         chat_id: TelegramChatId,
         user_id: TelegramUserId,
     ) -> AppResult<PlanFollowUpCallbackResult> {
-        require_group_admin(&self.telegram, chat_id, user_id).await?;
-
         let follow_up = self
             .storage
             .get_pending_plan_follow_up(&follow_up_id)

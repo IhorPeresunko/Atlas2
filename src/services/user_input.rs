@@ -10,10 +10,8 @@ use crate::{
     presentation::{render_user_input_prompt, render_user_input_summary, user_input_markup},
     provider::ProviderRegistry,
     storage::Storage,
-    telegram::{InlineKeyboardMarkup, TelegramApi},
+    telegram::InlineKeyboardMarkup,
 };
-
-use super::require_group_admin;
 
 pub enum UserInputCallbackResult {
     Render(String, InlineKeyboardMarkup),
@@ -36,19 +34,14 @@ enum UserInputAdvance {
 }
 
 #[derive(Clone)]
-pub struct UserInputService<Tg: TelegramApi> {
+pub struct UserInputService {
     storage: Storage,
-    telegram: Tg,
     providers: ProviderRegistry,
 }
 
-impl<Tg: TelegramApi> UserInputService<Tg> {
-    pub fn new(storage: Storage, telegram: Tg, providers: ProviderRegistry) -> Self {
-        Self {
-            storage,
-            telegram,
-            providers,
-        }
+impl UserInputService {
+    pub fn new(storage: Storage, providers: ProviderRegistry) -> Self {
+        Self { storage, providers }
     }
 
     pub async fn resolve_user_input_choice(
@@ -59,8 +52,6 @@ impl<Tg: TelegramApi> UserInputService<Tg> {
         question_index: usize,
         option_index: usize,
     ) -> AppResult<UserInputCallbackResult> {
-        require_group_admin(&self.telegram, chat_id, user_id).await?;
-
         let request = self
             .storage
             .get_pending_user_input(&request_id)
@@ -118,8 +109,6 @@ impl<Tg: TelegramApi> UserInputService<Tg> {
         user_id: TelegramUserId,
         text: &str,
     ) -> AppResult<Option<UserInputTextResult>> {
-        require_group_admin(&self.telegram, chat_id, user_id).await?;
-
         let request = match self
             .storage
             .get_pending_user_input_for_chat(chat_id)

@@ -1,7 +1,7 @@
 use crate::{
     config::Config,
     domain::{TelegramChatId, TelegramUserId},
-    error::{AppError, AppResult},
+    error::AppResult,
     filesystem::FilesystemService,
     provider::{ProviderRegistry, ThreadReaderRegistry},
     storage::Storage,
@@ -27,33 +27,17 @@ pub use resume::ResumeService;
 pub use turn::TurnService;
 pub use user_input::{UserInputCallbackResult, UserInputService, UserInputTextResult};
 
-/// Shared authorization helper: a chat action is allowed only for Telegram group
-/// admins. Used by `AppServices` and the extracted sub-services.
-pub(crate) async fn require_group_admin<Tg: TelegramApi>(
-    telegram: &Tg,
-    chat_id: TelegramChatId,
-    user_id: TelegramUserId,
-) -> AppResult<()> {
-    let member = telegram.get_chat_member(chat_id, user_id).await?;
-    if !member.is_admin() {
-        return Err(AppError::Validation(
-            "only Telegram group admins can perform this action".into(),
-        ));
-    }
-    Ok(())
-}
-
 #[derive(Clone)]
 pub struct AppServices<Tg: TelegramApi = TelegramClient> {
     pub config: Config,
     pub storage: Storage,
     pub telegram: Tg,
-    pub folder: FolderService<Tg>,
+    pub folder: FolderService,
     pub model: ModelService,
-    pub approvals: ApprovalService<Tg>,
-    pub user_input: UserInputService<Tg>,
-    pub plans: PlanService<Tg>,
-    pub resume: ResumeService<Tg>,
+    pub approvals: ApprovalService,
+    pub user_input: UserInputService,
+    pub plans: PlanService,
+    pub resume: ResumeService,
     pub turns: TurnService<Tg>,
 }
 
@@ -70,17 +54,15 @@ impl<Tg: TelegramApi + 'static> AppServices<Tg> {
         let model = ModelService::new(storage.clone(), providers.clone());
         let folder = FolderService::new(
             storage.clone(),
-            telegram.clone(),
             filesystem.clone(),
             config.clone(),
             model.clone(),
             providers.available_kinds(),
         );
-        let approvals = ApprovalService::new(storage.clone(), telegram.clone(), providers.clone());
-        let user_input =
-            UserInputService::new(storage.clone(), telegram.clone(), providers.clone());
-        let plans = PlanService::new(storage.clone(), telegram.clone());
-        let resume = ResumeService::new(storage.clone(), telegram.clone(), readers);
+        let approvals = ApprovalService::new(storage.clone(), providers.clone());
+        let user_input = UserInputService::new(storage.clone(), providers.clone());
+        let plans = PlanService::new(storage.clone());
+        let resume = ResumeService::new(storage.clone(), readers);
         let turns =
             TurnService::new(storage.clone(), telegram.clone(), providers, stt, model.clone());
         Self {
@@ -106,24 +88,86 @@ impl<Tg: TelegramApi + 'static> AppServices<Tg> {
         self.storage.upsert_chat(chat_id, chat_kind, title).await
     }
 
-    pub async fn require_group_admin(
+    /// The effective owner's Telegram user ID. An explicit config/env override
+    /// wins; otherwise it is the owner claimed at runtime (trust-on-first-use)
+    /// and persisted in storage. `None` means the bot is still unclaimed.
+    pub async fn owner_id(&self) -> AppResult<Option<i64>> {
+        if let Some(id) = self.config.owner_id {
+            return Ok(Some(id));
+        }
+        self.storage.get_owner_id().await
+    }
+
+    /// Whether `user_id` is the bot owner.
+    pub async fn is_owner(&self, user_id: TelegramUserId) -> AppResult<bool> {
+        Ok(self.owner_id().await? == Some(user_id.0))
+    }
+
+    /// Claims ownership for `user_id` if the bot is still unclaimed (no override
+    /// and nothing persisted). Returns `true` if this call established ownership.
+    /// A no-op once an owner exists, so it can be called on every first-contact
+    /// path without risk of takeover.
+    pub async fn try_claim_owner(&self, user_id: TelegramUserId) -> AppResult<bool> {
+        if self.config.owner_id.is_some() {
+            return Ok(false);
+        }
+        if self.storage.get_owner_id().await?.is_some() {
+            return Ok(false);
+        }
+        self.storage.set_owner_id(user_id.0).await?;
+        Ok(true)
+    }
+
+    /// Whether the bot may act on a message/callback from this chat. Private
+    /// chats are allowed only for the owner; group chats must have been
+    /// authorized by the owner (by adding the bot or running `/activate`). While
+    /// the bot is unclaimed it authorizes nothing.
+    pub async fn is_authorized(
         &self,
         chat_id: TelegramChatId,
+        chat_kind: &str,
         user_id: TelegramUserId,
+    ) -> AppResult<bool> {
+        let Some(owner) = self.owner_id().await? else {
+            return Ok(false);
+        };
+        if chat_kind == "private" {
+            return Ok(owner == user_id.0);
+        }
+        Ok(self
+            .storage
+            .get_chat(chat_id)
+            .await?
+            .map(|chat| chat.authorized)
+            .unwrap_or(false))
+    }
+
+    /// Marks a group chat as authorized; the owner added the bot or ran
+    /// `/activate`. Upserts the chat row so it works before any message arrives.
+    pub async fn authorize_chat(
+        &self,
+        chat_id: TelegramChatId,
+        chat_kind: &str,
+        title: Option<&str>,
     ) -> AppResult<()> {
-        require_group_admin(&self.telegram, chat_id, user_id).await
+        self.storage.upsert_chat(chat_id, chat_kind, title).await?;
+        self.storage.set_chat_authorized(chat_id, true).await
+    }
+
+    /// Revokes a chat's authorization; the owner ran `/deactivate` or the bot was
+    /// removed from the group.
+    pub async fn deauthorize_chat(&self, chat_id: TelegramChatId) -> AppResult<()> {
+        self.storage.set_chat_authorized(chat_id, false).await
     }
 
     /// Toggles whether the chat's agent skips permission prompts (`/yolo`).
-    /// `desired` of `None` flips the current value. Admin-only, since it lets the
-    /// agent run tools without approval.
+    /// `desired` of `None` flips the current value. Callers must already be in an
+    /// authorized chat (enforced at ingress), where every member has full access.
     pub async fn set_skip_permissions(
         &self,
         chat_id: TelegramChatId,
-        user_id: TelegramUserId,
         desired: Option<bool>,
     ) -> AppResult<String> {
-        self.require_group_admin(chat_id, user_id).await?;
         let current = self
             .storage
             .get_chat(chat_id)
@@ -200,6 +244,7 @@ mod tests {
     fn test_config() -> Config {
         Config {
             telegram_bot_token: "test-token".into(),
+            owner_id: None,
             telegram_api_base: "http://127.0.0.1:9".into(),
             database_url: "sqlite::memory:".into(),
             codex_bin: "codex".into(),
@@ -552,7 +597,7 @@ mod tests {
     use crate::error::{AppError, AppResult};
     use crate::filesystem::FilesystemService;
     use crate::telegram::{
-        Chat, ChatMember, InlineKeyboardMarkup, Message, TelegramApi, TelegramFile,
+        Chat, InlineKeyboardMarkup, Message, TelegramApi, TelegramFile,
     };
     use std::sync::{Arc, Mutex as StdMutex};
 
@@ -610,9 +655,7 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct FakeTelegram {
-        admin: bool,
-    }
+    struct FakeTelegram;
 
     fn fake_message() -> Message {
         Message {
@@ -664,35 +707,25 @@ mod tests {
         ) -> AppResult<bool> {
             Ok(true)
         }
-        async fn get_chat_member(
-            &self,
-            _chat_id: TelegramChatId,
-            _user_id: TelegramUserId,
-        ) -> AppResult<ChatMember> {
-            Ok(ChatMember {
-                status: if self.admin {
-                    "administrator".into()
-                } else {
-                    "member".into()
-                },
-            })
-        }
         async fn get_file(&self, _file_id: &str) -> AppResult<TelegramFile> {
             Ok(TelegramFile { file_path: None })
         }
         async fn download_file_bytes(&self, _file_path: &str) -> AppResult<Vec<u8>> {
             Ok(Vec::new())
         }
+        async fn leave_chat(&self, _chat_id: TelegramChatId) -> AppResult<bool> {
+            Ok(true)
+        }
     }
 
-    async fn services_with_fakes(admin: bool) -> (AppServices<FakeTelegram>, FakeCodex) {
+    async fn services_with_fakes() -> (AppServices<FakeTelegram>, FakeCodex) {
         let storage = Storage::connect("sqlite::memory:").await.unwrap();
         let codex = FakeCodex::default();
         let (providers, readers) = registries_for(codex.clone());
         let services = AppServices::new(
             test_config(),
             storage,
-            FakeTelegram { admin },
+            FakeTelegram,
             FilesystemService::default(),
             providers,
             readers,
@@ -772,7 +805,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_approval_approves_and_forwards_to_codex() {
         let chat_id = TelegramChatId(7);
-        let (services, codex) = services_with_fakes(true).await;
+        let (services, codex) = services_with_fakes().await;
         let session = seed_session(chat_id);
         services.storage.insert_session(&session).await.unwrap();
         let approval =
@@ -811,7 +844,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_approval_rejection_forwards_rejection_to_codex() {
         let chat_id = TelegramChatId(7);
-        let (services, codex) = services_with_fakes(true).await;
+        let (services, codex) = services_with_fakes().await;
         let session = seed_session(chat_id);
         services.storage.insert_session(&session).await.unwrap();
         let approval =
@@ -845,38 +878,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_approval_requires_group_admin() {
-        let chat_id = TelegramChatId(7);
-        let (services, codex) = services_with_fakes(false).await;
-        let session = seed_session(chat_id);
-        services.storage.insert_session(&session).await.unwrap();
-        let approval =
-            pending_approval(session.session_id.clone(), chat_id, ApprovalStatus::Pending);
-        services
-            .storage
-            .insert_pending_approval(&approval)
-            .await
-            .unwrap();
-
-        let result = services
-            .approvals
-            .resolve_approval(
-                approval.approval_id.clone(),
-                chat_id,
-                TelegramUserId(1),
-                true,
-            )
-            .await;
-
-        assert!(matches!(result, Err(AppError::Validation(_))));
-        // A non-admin click must never reach Codex.
-        assert!(codex.resolved_approvals.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
     async fn resolve_approval_rejects_foreign_chat() {
         let chat_id = TelegramChatId(7);
-        let (services, codex) = services_with_fakes(true).await;
+        let (services, codex) = services_with_fakes().await;
         let session = seed_session(chat_id);
         services.storage.insert_session(&session).await.unwrap();
         let approval =
@@ -904,7 +908,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_approval_rejects_already_resolved() {
         let chat_id = TelegramChatId(7);
-        let (services, codex) = services_with_fakes(true).await;
+        let (services, codex) = services_with_fakes().await;
         let session = seed_session(chat_id);
         services.storage.insert_session(&session).await.unwrap();
         let approval = pending_approval(
@@ -935,7 +939,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_user_input_advances_to_next_question() {
         let chat_id = TelegramChatId(7);
-        let (services, codex) = services_with_fakes(true).await;
+        let (services, codex) = services_with_fakes().await;
         let session = seed_session(chat_id);
         services.storage.insert_session(&session).await.unwrap();
         let request = pending_user_input(session.session_id.clone(), chat_id, 2);
@@ -959,7 +963,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_user_input_completes_and_forwards_to_codex() {
         let chat_id = TelegramChatId(7);
-        let (services, codex) = services_with_fakes(true).await;
+        let (services, codex) = services_with_fakes().await;
         let session = seed_session(chat_id);
         services.storage.insert_session(&session).await.unwrap();
         let request = pending_user_input(session.session_id.clone(), chat_id, 1);
@@ -984,7 +988,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_user_input_rejects_out_of_order_answer() {
         let chat_id = TelegramChatId(7);
-        let (services, codex) = services_with_fakes(true).await;
+        let (services, codex) = services_with_fakes().await;
         let session = seed_session(chat_id);
         services.storage.insert_session(&session).await.unwrap();
         let request = pending_user_input(session.session_id.clone(), chat_id, 2);
@@ -1005,24 +1009,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_turn_requires_group_admin() {
-        let chat_id = TelegramChatId(7);
-        let (services, _codex) = services_with_fakes(false).await;
-        let session = seed_session(chat_id);
-        services.storage.insert_session(&session).await.unwrap();
-
-        let result = services
-            .turns
-            .stop_turn(session.session_id.clone(), chat_id, TelegramUserId(1))
-            .await;
-
-        assert!(matches!(result, Err(AppError::Validation(_))));
-    }
-
-    #[tokio::test]
     async fn stop_turn_rejects_when_no_turn_is_live() {
         let chat_id = TelegramChatId(7);
-        let (services, _codex) = services_with_fakes(true).await;
+        let (services, _codex) = services_with_fakes().await;
         let session = seed_session(chat_id);
         services.storage.insert_session(&session).await.unwrap();
         services
@@ -1034,14 +1023,14 @@ mod tests {
         // Active session, but no turn registered as live -> rejected.
         let result = services
             .turns
-            .stop_turn(session.session_id.clone(), chat_id, TelegramUserId(1))
+            .stop_turn(session.session_id.clone(), chat_id)
             .await;
         assert!(matches!(result, Err(AppError::Validation(_))));
 
         // A session id that is not the active one -> "turn is no longer active".
         let result = services
             .turns
-            .stop_turn(SessionId::new(), chat_id, TelegramUserId(1))
+            .stop_turn(SessionId::new(), chat_id)
             .await;
         assert!(matches!(result, Err(AppError::Validation(_))));
     }

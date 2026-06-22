@@ -6,7 +6,7 @@ use crate::{
     config::Config,
     domain::{
         FolderBrowseState, HistoricProject, ProviderKind, SessionId, SessionRecord, SessionStatus,
-        TelegramChatId, TelegramUserId, WorkspacePath,
+        TelegramChatId, WorkspacePath,
     },
     error::{AppError, AppResult},
     filesystem::FilesystemService,
@@ -15,10 +15,10 @@ use crate::{
         render_provider_picker_prompt,
     },
     storage::Storage,
-    telegram::{InlineKeyboardMarkup, TelegramApi, button},
+    telegram::{InlineKeyboardMarkup, button},
 };
 
-use super::{model::ModelService, require_group_admin};
+use super::model::ModelService;
 
 const HISTORIC_PROJECT_LIMIT: usize = 8;
 
@@ -28,9 +28,8 @@ pub enum FolderCallbackResult {
 }
 
 #[derive(Clone)]
-pub struct FolderService<Tg: TelegramApi> {
+pub struct FolderService {
     storage: Storage,
-    telegram: Tg,
     filesystem: FilesystemService,
     config: Config,
     model: ModelService,
@@ -39,10 +38,9 @@ pub struct FolderService<Tg: TelegramApi> {
     available_providers: Vec<ProviderKind>,
 }
 
-impl<Tg: TelegramApi> FolderService<Tg> {
+impl FolderService {
     pub fn new(
         storage: Storage,
-        telegram: Tg,
         filesystem: FilesystemService,
         config: Config,
         model: ModelService,
@@ -50,7 +48,6 @@ impl<Tg: TelegramApi> FolderService<Tg> {
     ) -> Self {
         Self {
             storage,
-            telegram,
             filesystem,
             config,
             model,
@@ -93,10 +90,8 @@ impl<Tg: TelegramApi> FolderService<Tg> {
     pub async fn handle_folder_callback(
         &self,
         chat_id: TelegramChatId,
-        user_id: TelegramUserId,
         payload: &str,
     ) -> AppResult<FolderCallbackResult> {
-        require_group_admin(&self.telegram, chat_id, user_id).await?;
         self.handle_folder_callback_authorized(chat_id, payload)
             .await
     }

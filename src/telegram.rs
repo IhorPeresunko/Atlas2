@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use crate::{
-    domain::{TelegramChatId, TelegramUserId},
+    domain::TelegramChatId,
     error::{AppError, AppResult},
 };
 
@@ -54,7 +54,7 @@ impl TelegramClient {
     ) -> AppResult<Vec<Update>> {
         let mut payload = json!({
             "timeout": timeout_seconds,
-            "allowed_updates": ["message", "callback_query"]
+            "allowed_updates": ["message", "callback_query", "my_chat_member"]
         });
         if let Some(offset) = offset {
             payload["offset"] = json!(offset);
@@ -155,23 +155,15 @@ impl TelegramClient {
         .await
     }
 
-    pub async fn get_chat_member(
-        &self,
-        chat_id: TelegramChatId,
-        user_id: TelegramUserId,
-    ) -> AppResult<ChatMember> {
-        self.call(
-            "getChatMember",
-            &json!({
-                "chat_id": chat_id.0,
-                "user_id": user_id.0,
-            }),
-        )
-        .await
-    }
-
     pub async fn get_file(&self, file_id: &str) -> AppResult<TelegramFile> {
         self.call("getFile", &json!({ "file_id": file_id })).await
+    }
+
+    /// Removes the bot from a chat. Used to refuse groups added by anyone other
+    /// than the owner, so the bot never lingers in unauthorized groups.
+    pub async fn leave_chat(&self, chat_id: TelegramChatId) -> AppResult<bool> {
+        self.call("leaveChat", &json!({ "chat_id": chat_id.0 }))
+            .await
     }
 
     pub async fn download_file_bytes(&self, file_path: &str) -> AppResult<Vec<u8>> {
@@ -271,15 +263,11 @@ pub(crate) trait TelegramApi: Clone + Send + Sync {
         show_alert: bool,
     ) -> AppResult<bool>;
 
-    async fn get_chat_member(
-        &self,
-        chat_id: TelegramChatId,
-        user_id: TelegramUserId,
-    ) -> AppResult<ChatMember>;
-
     async fn get_file(&self, file_id: &str) -> AppResult<TelegramFile>;
 
     async fn download_file_bytes(&self, file_path: &str) -> AppResult<Vec<u8>>;
+
+    async fn leave_chat(&self, chat_id: TelegramChatId) -> AppResult<bool>;
 }
 
 #[async_trait::async_trait]
@@ -319,20 +307,16 @@ impl TelegramApi for TelegramClient {
         TelegramClient::answer_callback_query(self, callback_query_id, text, show_alert).await
     }
 
-    async fn get_chat_member(
-        &self,
-        chat_id: TelegramChatId,
-        user_id: TelegramUserId,
-    ) -> AppResult<ChatMember> {
-        TelegramClient::get_chat_member(self, chat_id, user_id).await
-    }
-
     async fn get_file(&self, file_id: &str) -> AppResult<TelegramFile> {
         TelegramClient::get_file(self, file_id).await
     }
 
     async fn download_file_bytes(&self, file_path: &str) -> AppResult<Vec<u8>> {
         TelegramClient::download_file_bytes(self, file_path).await
+    }
+
+    async fn leave_chat(&self, chat_id: TelegramChatId) -> AppResult<bool> {
+        TelegramClient::leave_chat(self, chat_id).await
     }
 }
 
@@ -432,6 +416,19 @@ pub struct Update {
     pub update_id: i64,
     pub message: Option<Message>,
     pub callback_query: Option<CallbackQuery>,
+    /// Delivered when the bot's own membership in a chat changes (added, removed,
+    /// promoted). Carries the actor in `from`, which lets the bot enforce that
+    /// only the owner may add it to groups.
+    pub my_chat_member: Option<ChatMemberUpdated>,
+}
+
+/// A change to a chat member's status. Atlas2 only consumes the variant for the
+/// bot itself (`my_chat_member`), to detect who added or removed it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatMemberUpdated {
+    pub chat: Chat,
+    pub from: User,
+    pub new_chat_member: ChatMember,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -486,8 +483,13 @@ pub struct ChatMember {
 }
 
 impl ChatMember {
-    pub fn is_admin(&self) -> bool {
-        matches!(self.status.as_str(), "administrator" | "creator")
+    /// True when this status means the bot is a member of the chat (as opposed to
+    /// having left or been removed).
+    pub fn is_present(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "member" | "administrator" | "creator" | "restricted"
+        )
     }
 }
 
@@ -564,6 +566,33 @@ mod tests {
         assert_eq!(voice.file_id, "voice-file");
         assert_eq!(voice.file_unique_id, "voice-unique");
         assert_eq!(voice.mime_type.as_deref(), Some("audio/ogg"));
+    }
+
+    #[test]
+    fn deserializes_my_chat_member_update() {
+        // Mirrors what Telegram sends when the bot is added to a group: the
+        // actor in `from` and the bot's new membership status. This locks in that
+        // the optional `my_chat_member` field parses and that an absent
+        // `message`/`callback_query` is tolerated.
+        let update: Update = serde_json::from_str(
+            r#"{
+                "update_id": 5,
+                "my_chat_member": {
+                    "chat": {"id": -1002, "type": "supergroup", "title": "Team"},
+                    "from": {"id": 42, "username": "owner", "first_name": "Owner"},
+                    "date": 1700000000,
+                    "old_chat_member": {"status": "left", "user": {"id": 7, "first_name": "Bot", "is_bot": true}},
+                    "new_chat_member": {"status": "member", "user": {"id": 7, "first_name": "Bot", "is_bot": true}}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let membership = update.my_chat_member.expect("my_chat_member present");
+        assert_eq!(membership.chat.id, -1002);
+        assert_eq!(membership.from.id, 42);
+        assert!(membership.new_chat_member.is_present());
+        assert!(update.message.is_none());
     }
 
     #[test]

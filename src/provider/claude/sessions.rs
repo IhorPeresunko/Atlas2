@@ -179,11 +179,18 @@ async fn read_thread_summary(file: &Path, cwd: &str) -> Option<ThreadSummary> {
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        if let Some(line_cwd) = value.get("cwd").and_then(Value::as_str) {
-            if line_cwd != cwd {
-                return None;
+        // Only the first cwd line is authoritative: a session may cd into
+        // subdirectories mid-run, producing later lines with a different cwd.
+        // Rejecting on the first non-matching cwd is correct; ignoring
+        // subsequent cwd changes lets us list the thread under its starting
+        // workspace rather than silently dropping it.
+        if !matched_cwd {
+            if let Some(line_cwd) = value.get("cwd").and_then(Value::as_str) {
+                if line_cwd != cwd {
+                    return None;
+                }
+                matched_cwd = true;
             }
-            matched_cwd = true;
         }
         if started_at.is_none()
             && let Some(ts) = value.get("timestamp").and_then(Value::as_str)
@@ -196,6 +203,9 @@ async fn read_thread_summary(file: &Path, cwd: &str) -> Option<ThreadSummary> {
             && message.role == MessageRole::User
         {
             preview = first_nonempty_line(&message.text);
+        }
+        if matched_cwd && started_at.is_some() && !preview.is_empty() {
+            break;
         }
     }
 
@@ -330,6 +340,30 @@ mod tests {
         let limited = reader.list_threads_for_cwd("/work/match", 1).await.unwrap();
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].thread_id.0, "11111111-0000-0000-0000-000000000002");
+    }
+
+    #[tokio::test]
+    async fn lists_thread_that_changed_cwd_mid_session() {
+        let temp = tempdir().unwrap();
+        let reader = ClaudeThreadReader::new(temp.path().to_path_buf());
+
+        // Session started at /work/match, then cded into a subdirectory.
+        // The thread must still appear when listing /work/match.
+        let no_cwd_line = r#"{"type":"queue-operation","timestamp":"2026-01-02T10:00:00Z"}"#;
+        write_transcript(
+            temp.path(),
+            "-work-match",
+            "66666666-0000-0000-0000-000000000001",
+            &[
+                no_cwd_line.to_string(),
+                user_line("/work/match", "2026-01-02T10:00:01Z", "initial prompt"),
+                user_line("/work/match/sub", "2026-01-02T10:05:00Z", "later in subdir"),
+            ],
+        );
+
+        let threads = reader.list_threads_for_cwd("/work/match", 10).await.unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].preview, "initial prompt");
     }
 
     #[tokio::test]

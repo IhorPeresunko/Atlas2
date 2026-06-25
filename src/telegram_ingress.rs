@@ -67,8 +67,18 @@ where
 
         // Authorization gate: silently ignore anything from a chat the owner has
         // not authorized, and any private chat that is not the owner's. This is
-        // the single chokepoint that keeps strangers from driving the agent.
-        if !services.is_authorized(chat_id, &chat_kind, user_id).await? {
+        // the single chokepoint that keeps strangers from driving the agent. The
+        // owner's own interaction in a group auto-activates it (see helper).
+        if !ensure_chat_authorized(
+            services,
+            update_id,
+            chat_id,
+            &chat_kind,
+            chat_title.as_deref(),
+            user_id,
+        )
+        .await?
+        {
             tracing::warn!(
                 update_id,
                 chat_id = chat_id.0,
@@ -351,11 +361,22 @@ where
         };
         let chat_id = TelegramChatId(message.chat.id);
         let chat_kind = message.chat.kind.clone();
+        let chat_title = message.chat.title.clone();
         let user_id = TelegramUserId(callback.from.id);
 
         // Same authorization gate as messages: a callback from an unauthorized
-        // chat (or a non-owner DM) must never reach a handler.
-        if !services.is_authorized(chat_id, &chat_kind, user_id).await? {
+        // chat (or a non-owner DM) must never reach a handler. The owner's own
+        // interaction in a group auto-activates it (see helper).
+        if !ensure_chat_authorized(
+            services,
+            update_id,
+            chat_id,
+            &chat_kind,
+            chat_title.as_deref(),
+            user_id,
+        )
+        .await?
+        {
             tracing::warn!(
                 update_id,
                 chat_id = chat_id.0,
@@ -614,6 +635,58 @@ where
     Ok(())
 }
 
+/// Authorization gate shared by the message and callback paths. Returns whether
+/// the bot may act on this chat.
+///
+/// Beyond the stored authorization flag, this auto-activates a group the moment
+/// the **owner** interacts in it: only the owner can have added the bot to a
+/// group (a non-owner add gets the bot kicked), so the owner showing up is
+/// authorization in itself. This removes the need to run `/activate` and
+/// self-heals groups whose add-event was missed (e.g. the bot was added while
+/// the daemon was down).
+async fn ensure_chat_authorized<Tg>(
+    services: &AppServices<Tg>,
+    update_id: i64,
+    chat_id: TelegramChatId,
+    chat_kind: &str,
+    chat_title: Option<&str>,
+    user_id: TelegramUserId,
+) -> AppResult<bool>
+where
+    Tg: TelegramApi + 'static,
+{
+    if services.is_authorized(chat_id, chat_kind, user_id).await? {
+        return Ok(true);
+    }
+    if chat_kind != "private" && services.is_owner(user_id).await? {
+        services
+            .authorize_chat(chat_id, chat_kind, chat_title)
+            .await?;
+        tracing::info!(
+            update_id,
+            chat_id = chat_id.0,
+            "owner interacted in an unauthorized group; chat authorized"
+        );
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Confirmation sent when a group is activated, tailored to whether the bot has
+/// the admin rights it needs. A non-admin bot is subject to Telegram group
+/// privacy mode (on by default), which withholds ordinary messages — only
+/// commands and replies reach it — so the owner is told to promote it before the
+/// group is usable for normal chatting.
+fn group_activated_message(bot_is_admin: bool) -> &'static str {
+    if bot_is_admin {
+        "✅ Atlas2 is active here and I can read messages. Send /new to start."
+    } else {
+        "⚠️ Atlas2 is active here, but I'm not a group admin — Telegram only lets me see \
+         /commands and replies, not normal messages. Make me an admin (or disable privacy \
+         mode in @BotFather), then everyone can just chat with me. Send /new to start."
+    }
+}
+
 /// Reacts to a change in the bot's own membership in a chat. This is how the
 /// "only the owner can add the bot to a group" rule is enforced: the bot leaves
 /// any group it was added to by someone other than the owner, and auto-authorizes
@@ -631,6 +704,7 @@ where
     let chat_title = membership.chat.title.clone();
     let actor = TelegramUserId(membership.from.id);
     let bot_present = membership.new_chat_member.is_present();
+    let bot_is_admin = membership.new_chat_member.is_admin();
 
     // Private chats are authorized per-message by owner identity, not by a stored
     // flag, so membership changes there need no action.
@@ -665,7 +739,10 @@ where
                 .telegram
                 .send_message(
                     chat_id,
-                    "✅ You are now the owner of this bot, and this group is active. Everyone here can use it — send /new to start.",
+                    &format!(
+                        "✅ You are now the owner of this bot.\n\n{}",
+                        group_activated_message(bot_is_admin)
+                    ),
                     None,
                     None,
                 )
@@ -685,12 +762,7 @@ where
         );
         let _ = services
             .telegram
-            .send_message(
-                chat_id,
-                "Atlas2 activated by the owner. Everyone in this group can use it now — send /new to start.",
-                None,
-                None,
-            )
+            .send_message(chat_id, group_activated_message(bot_is_admin), None, None)
             .await;
     } else {
         tracing::warn!(
@@ -1003,6 +1075,19 @@ mod tests {
         );
         assert_eq!(parse_activation("/new"), None);
         assert_eq!(parse_activation("hello"), None);
+    }
+
+    #[test]
+    fn group_activation_message_warns_only_without_admin() {
+        use super::group_activated_message;
+        // Admin: clean confirmation, no privacy-mode warning.
+        let admin = group_activated_message(true);
+        assert!(!admin.contains("admin"));
+        assert!(admin.contains("/new"));
+        // Non-admin: must tell the owner why normal messages won't work.
+        let non_admin = group_activated_message(false);
+        assert!(non_admin.contains("admin"));
+        assert!(non_admin.to_lowercase().contains("privacy"));
     }
 
     #[test]

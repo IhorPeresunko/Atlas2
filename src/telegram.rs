@@ -491,6 +491,14 @@ impl ChatMember {
             "member" | "administrator" | "creator" | "restricted"
         )
     }
+
+    /// True when this status grants admin rights. A non-admin bot is subject to
+    /// Telegram group privacy mode, which withholds ordinary text messages (only
+    /// commands, @mentions, and replies reach it), so the bot must warn the owner
+    /// to promote it before it can act on normal messages.
+    pub fn is_admin(&self) -> bool {
+        matches!(self.status.as_str(), "administrator" | "creator")
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -539,8 +547,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        BotCommand, ParseMode, TELEGRAM_TEXT_LIMIT, TelegramEnvelope, TelegramFile, Update,
-        split_message_text, telegram_retry_after_seconds, trim_message_text,
+        BotCommand, ChatMember, ParseMode, TELEGRAM_TEXT_LIMIT, TelegramEnvelope, TelegramFile,
+        Update, split_message_text, telegram_retry_after_seconds, trim_message_text,
     };
 
     #[test]
@@ -592,7 +600,38 @@ mod tests {
         assert_eq!(membership.chat.id, -1002);
         assert_eq!(membership.from.id, 42);
         assert!(membership.new_chat_member.is_present());
+        // Added as a plain member, so not an admin: privacy mode applies.
+        assert!(!membership.new_chat_member.is_admin());
         assert!(update.message.is_none());
+    }
+
+    #[test]
+    fn chat_member_admin_status_is_recognized() {
+        let present_non_admin = ["member", "restricted"];
+        let admin = ["administrator", "creator"];
+        let absent = ["left", "kicked"];
+
+        for status in present_non_admin {
+            let member = ChatMember {
+                status: status.to_string(),
+            };
+            assert!(member.is_present(), "{status} should be present");
+            assert!(!member.is_admin(), "{status} should not be admin");
+        }
+        for status in admin {
+            let member = ChatMember {
+                status: status.to_string(),
+            };
+            assert!(member.is_present(), "{status} should be present");
+            assert!(member.is_admin(), "{status} should be admin");
+        }
+        for status in absent {
+            let member = ChatMember {
+                status: status.to_string(),
+            };
+            assert!(!member.is_present(), "{status} should be absent");
+            assert!(!member.is_admin(), "{status} should not be admin");
+        }
     }
 
     #[test]

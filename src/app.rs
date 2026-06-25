@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::{
     config::{Config, ServeArgs},
@@ -15,6 +15,11 @@ use crate::{
     telegram::TelegramClient,
     telegram_ingress,
 };
+
+/// Upper bound on the exponential backoff between failed `getUpdates` polls, so
+/// the daemon keeps retrying briefly through a Telegram outage rather than
+/// either hammering the API or giving up.
+const MAX_POLL_BACKOFF_SECS: u64 = 30;
 
 #[derive(Clone)]
 pub struct App {
@@ -51,13 +56,31 @@ impl App {
     pub async fn run(self) -> AppResult<()> {
         tracing::info!("Atlas2 starting with Telegram long polling");
         let mut offset = None;
+        let mut backoff_secs = 0u64;
 
         loop {
-            let updates = self
+            let updates = match self
                 .services
                 .telegram
                 .get_updates(offset, self.services.config.poll_timeout_seconds)
-                .await?;
+                .await
+            {
+                Ok(updates) => {
+                    backoff_secs = 0;
+                    updates
+                }
+                // A transient Telegram-side failure (e.g. a 502 Bad Gateway, which
+                // Telegram returns routinely) must never take the daemon down. Log
+                // it, back off, and keep polling. `offset` is left untouched so the
+                // same batch is re-fetched once Telegram recovers; persistent
+                // misconfiguration (e.g. a bad token) is already caught at startup.
+                Err(error) => {
+                    backoff_secs = (backoff_secs * 2).clamp(1, MAX_POLL_BACKOFF_SECS);
+                    tracing::warn!(%error, backoff_secs, "getUpdates failed; retrying after backoff");
+                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    continue;
+                }
+            };
 
             for update in updates {
                 offset = Some(update.update_id + 1);
